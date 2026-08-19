@@ -89,17 +89,116 @@ if os.environ.get("DISABLE_XVFB") != "1" and (not os.environ.get("DISPLAY") or _
 EXTENSION_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "turnstilePatch"))
 
 _browser_proxy = ""
-try:
-    import json as _json_mod
-    _cfg_path = os.path.join(os.path.dirname(__file__), "config.json")
-    if os.path.isfile(_cfg_path):
-        with open(_cfg_path, "r") as _f:
-            _cfg = _json_mod.load(_f)
-        _browser_proxy = str(_cfg.get("browser_proxy", "") or _cfg.get("proxy", "") or "")
-except Exception:
-    pass
-if _browser_proxy:
-    print(f"[*] 浏览器代理: {_browser_proxy}")
+_proxy_pool: list = []
+_proxy_index = 0
+_proxy_dead: set = set()
+
+
+def _normalize_proxy(raw) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    if "://" not in value:
+        value = "http://" + value
+    return value
+
+
+def _load_proxy_pool() -> list:
+    # browser_proxies 优先轮询；browser_proxy 作为补充。不要把 DuckMail 的 proxy 混进浏览器出口。
+    proxies = []
+    try:
+        import json as _json_mod
+        cfg_path = os.path.join(os.path.dirname(__file__), "config.json")
+        if os.path.isfile(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as handle:
+                cfg = _json_mod.load(handle)
+            for item in cfg.get("browser_proxies") or []:
+                proxy = _normalize_proxy(item)
+                if proxy and proxy not in proxies:
+                    proxies.append(proxy)
+            single = _normalize_proxy(cfg.get("browser_proxy", ""))
+            if single and single not in proxies:
+                proxies.append(single)
+    except Exception:
+        pass
+    return proxies
+
+
+def _preflight_proxy(proxy: str, timeout: float = 8.0) -> bool:
+    # 只验证代理能否建立 HTTPS CONNECT。x.ai 对 curl 常返回 403，不能当作代理已死。
+    import subprocess
+    try:
+        result = subprocess.run(
+            [
+                "curl", "-sS", "-o", "/dev/null", "--max-time", str(int(timeout)),
+                "--connect-timeout", "5", "-x", proxy, "https://ifconfig.me",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout + 2,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _preflight_proxy_pool(proxies: list) -> list:
+    if not proxies:
+        return []
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    alive = []
+    print(f"[*] 预检 {len(proxies)} 条浏览器代理...")
+    with ThreadPoolExecutor(max_workers=min(8, len(proxies))) as pool:
+        futures = {pool.submit(_preflight_proxy, proxy): proxy for proxy in proxies}
+        for future in as_completed(futures):
+            proxy = futures[future]
+            ok = False
+            try:
+                ok = bool(future.result())
+            except Exception:
+                ok = False
+            print(f"    {'OK' if ok else 'DEAD'} {proxy}")
+            if ok:
+                alive.append(proxy)
+    if alive:
+        # 保持配置顺序，方便按国家/来源轮询。
+        order = {item: idx for idx, item in enumerate(proxies)}
+        alive.sort(key=lambda item: order.get(item, 999))
+        print(f"[*] 预检通过 {len(alive)}/{len(proxies)} 条，将按此列表轮询")
+        return alive
+    print("[Warn] 预检全部失败，仍按原列表在启动浏览器时轮询")
+    return proxies
+
+
+def select_browser_proxy() -> str:
+    global _browser_proxy, _proxy_index
+    alive = [item for item in _proxy_pool if item not in _proxy_dead]
+    if not alive:
+        if _proxy_dead:
+            print("[Warn] 代理池全部失败过，清空失败标记后重试")
+            _proxy_dead.clear()
+        alive = list(_proxy_pool)
+    if not alive:
+        _browser_proxy = ""
+        return ""
+    proxy = alive[_proxy_index % len(alive)]
+    _proxy_index += 1
+    _browser_proxy = proxy
+    print(f"[*] 本轮浏览器代理: {proxy} ({((_proxy_index - 1) % len(alive)) + 1}/{len(alive)})")
+    return proxy
+
+
+def mark_proxy_dead(reason: str = "") -> None:
+    if not _browser_proxy:
+        return
+    _proxy_dead.add(_browser_proxy)
+    extra = f" ({reason})" if reason else ""
+    print(f"[Warn] 代理标记失败并跳过: {_browser_proxy}{extra}")
+
+
+_proxy_pool = _load_proxy_pool()
+if _proxy_pool:
+    print(f"[*] 浏览器代理池: {len(_proxy_pool)} 条")
 
 
 def _detect_chrome_path() -> str:
@@ -157,10 +256,12 @@ DEFAULT_SSO_FILE = os.path.join(_sso_dir, f"sso_{_sso_ts}.txt")
 
 
 def start_browser():
-    # 对齐参考实现：每次启动都新建 ChromiumOptions，失败最多重试 4 次。
+    # 对齐参考实现：每次启动都新建 ChromiumOptions；代理池按轮询切换，失败则换下一条。
     global browser, page
     last_exc = None
-    for attempt in range(1, 5):
+    attempts = max(4, len(_proxy_pool) or 1)
+    for attempt in range(1, attempts + 1):
+        select_browser_proxy()
         try:
             browser = Chromium(create_browser_options())
             tabs = browser.get_tabs()
@@ -170,7 +271,8 @@ def start_browser():
             return browser, page
         except Exception as exc:
             last_exc = exc
-            print(f"[Debug] 浏览器启动失败(第{attempt}/4次): {exc}")
+            print(f"[Debug] 浏览器启动失败(第{attempt}/{attempts}次): {exc}")
+            mark_proxy_dead(str(exc).split("\n", 1)[0][:120])
             try:
                 if browser is not None:
                     browser.quit(del_data=True)
@@ -178,8 +280,8 @@ def start_browser():
                 pass
             browser = None
             page = None
-            time.sleep(min(1.5 * attempt, 4))
-    raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
+            time.sleep(min(1.2 * attempt, 4))
+    raise Exception(f"浏览器启动失败，已重试{attempts}次: {last_exc}")
 
 
 def stop_browser():
@@ -1352,11 +1454,12 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
 
     if run_logger:
         run_logger.info(
-            "注册成功 | email=%s | password=%s | given=%s | family=%s",
+            "注册成功 | email=%s | password=%s | given=%s | family=%s | proxy=%s",
             email,
             profile.get("password", ""),
             profile.get("given_name", ""),
             profile.get("family_name", ""),
+            _browser_proxy,
         )
 
     print(f"[*] 本轮注册完成，邮箱: {email}")
@@ -1380,7 +1483,7 @@ def load_run_count() -> int:
 
 def main():
     # 默认循环执行；每轮完成后关闭当前页，再自动进入下一轮。
-    global run_logger
+    global run_logger, _proxy_pool
     run_logger = setup_run_logger()
 
     config_count = load_run_count()
@@ -1393,6 +1496,12 @@ def main():
 
     current_round = 0
     collected_sso: list = []
+    success_count = 0
+    fail_count = 0
+    if _proxy_pool:
+        _proxy_pool = _preflight_proxy_pool(_proxy_pool)
+        if run_logger:
+            run_logger.info("代理池预检后剩余 %s 条", len(_proxy_pool))
     try:
         start_browser()
         while True:
@@ -1400,25 +1509,31 @@ def main():
                 break
 
             current_round += 1
-            print(f"\n[*] 开始第 {current_round} 轮注册")
-            round_succeeded = False
+            print(f"\n[*] 开始第 {current_round} 轮注册（成功 {success_count} / 失败 {fail_count}）")
+            more_rounds = args.count == 0 or current_round < args.count
 
             try:
                 result = run_single_registration(args.output, extract_numbers=args.extract_numbers)
                 collected_sso.append(result["sso"])
-                round_succeeded = True
+                success_count += 1
             except KeyboardInterrupt:
                 print("\n[Info] 收到中断信号，停止后续轮次。")
                 break
             except Exception as error:
+                fail_count += 1
                 print(f"[Error] 第 {current_round} 轮失败: {error}")
+                err_text = str(error)
+                if any(marker in err_text for marker in ("Turnstile", "未找到最终注册表单", "人机", "Cloudflare")):
+                    mark_proxy_dead(err_text.split("\n", 1)[0][:120])
                 if run_logger:
-                    run_logger.error("注册失败 | round=%s | error=%s", current_round, error)
+                    run_logger.error("注册失败 | round=%s | proxy=%s | error=%s", current_round, _browser_proxy, error)
             finally:
-                restart_browser()
+                if more_rounds:
+                    restart_browser()
 
-            if args.count == 0 or current_round < args.count:
+            if more_rounds:
                 time.sleep(2)
+        print(f"\n[*] 本批结束：成功 {success_count}，失败 {fail_count}，共 {current_round} 轮")
 
     finally:
         if collected_sso:
