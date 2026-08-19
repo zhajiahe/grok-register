@@ -256,15 +256,65 @@ return true;
     raise Exception('未找到“使用邮箱注册”按钮')
 
 
-def fill_email_and_submit(timeout=15):
-    # 复用 `email_register.py` 里的邮箱获取逻辑，保留邮箱与 token 供后续验证码步骤继续使用。
-    email, dev_token = get_email_and_token()
-    if not email or not dev_token:
-        raise Exception("获取邮箱失败")
+def _visible_page_text() -> str:
+    refresh_active_page()
+    try:
+        return str(page.run_js("return (document.body && document.body.innerText) || ''") or "")
+    except Exception:
+        return ""
 
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        filled = page.run_js(
+
+def _signup_email_feedback() -> str:
+    # 提交邮箱后立刻判断：域名被拒 / 进入验证码 / 进入资料页。
+    text = _visible_page_text()
+    lower = text.lower()
+    if (
+        "has been rejected" in lower
+        or "use a different email" in lower
+        or ("邮箱域名" in text and "拒绝" in text)
+        or "已被拒绝" in text
+    ):
+        return "rejected"
+    if has_profile_form():
+        return "profile"
+    try:
+        otp_ready = page.run_js(
+            r"""
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+const otp = Array.from(document.querySelectorAll(
+    'input[data-input-otp="true"], input[name="code"], input[autocomplete="one-time-code"], input[inputmode="numeric"], input[inputmode="text"]'
+)).some((node) => isVisible(node) && !node.disabled);
+return otp;
+            """
+        )
+        if otp_ready:
+            return "otp"
+    except Exception:
+        pass
+    return "pending"
+
+
+def fill_email_and_submit(timeout=45):
+    # 复用 `email_register.py` 里的邮箱获取逻辑；x.ai 会拒绝 duckmail.sbs，被拒后自动换域重试。
+    excluded_domains: list = []
+    last_error = "获取邮箱失败"
+    attempt_deadline = time.time() + timeout
+
+    while time.time() < attempt_deadline:
+        email, dev_token = get_email_and_token(exclude_domains=excluded_domains)
+        if not email or not dev_token:
+            raise Exception(last_error)
+
+        write_deadline = min(time.time() + 15, attempt_deadline)
+        submitted = False
+        while time.time() < write_deadline:
+            filled = page.run_js(
             """
 const email = arguments[0];
 
@@ -323,18 +373,17 @@ input.blur();
 return 'filled';
             """,
             email,
-        )
+            )
 
-        if filled == 'not-ready':
-            time.sleep(0.5)
-            continue
+            if filled == 'not-ready':
+                time.sleep(0.5)
+                continue
 
-        if filled != 'filled':
-            print(f"[Debug] 邮箱输入框已出现，但写入失败: {filled}")
-            time.sleep(0.5)
-            continue
+            if filled != 'filled':
+                print(f"[Debug] 邮箱输入框已出现，但写入失败: {filled}")
+                time.sleep(0.5)
+                continue
 
-        if filled == 'filled':
             time.sleep(0.8)
             clicked = page.run_js(
                 r"""
@@ -377,17 +426,44 @@ return true;
 
             if clicked:
                 print(f"[*] 已填写邮箱并点击注册: {email}")
-                return email, dev_token
+                submitted = True
+                break
 
-        time.sleep(0.5)
+            time.sleep(0.5)
 
-    raise Exception("未找到邮箱输入框或注册按钮")
+        if not submitted:
+            last_error = "未找到邮箱输入框或注册按钮"
+            continue
+
+        feedback = "pending"
+        wait_deadline = min(time.time() + 8, attempt_deadline)
+        while time.time() < wait_deadline:
+            feedback = _signup_email_feedback()
+            if feedback in ("otp", "profile", "rejected"):
+                break
+            time.sleep(0.4)
+
+        if feedback in ("otp", "profile"):
+            return email, dev_token
+
+        if feedback == "rejected":
+            domain = email.split("@")[-1].lower() if "@" in email else email
+            if domain not in excluded_domains:
+                excluded_domains.append(domain)
+            last_error = f"邮箱域名已被 x.ai 拒绝: {domain}"
+            print(f"[Warn] {last_error}，改用其它 DuckMail 域名重试")
+            continue
+
+        # 没有明确错误也没有验证码页时，仍把当前邮箱交给后续 OTP 轮询。
+        return email, dev_token
+
+    raise Exception(last_error)
 
 
 
 def fill_code_and_submit(email, dev_token, timeout=60):
     # 复用 `email_register.py` 里的验证码轮询逻辑，等待邮件到达后自动填写 OTP。
-    code = get_oai_code(dev_token, email)
+    code = get_oai_code(dev_token, email, timeout=90)
     if not code:
         raise Exception("获取验证码失败")
 
@@ -1219,6 +1295,8 @@ def main():
                 break
             except Exception as error:
                 print(f"[Error] 第 {current_round} 轮失败: {error}")
+                if run_logger:
+                    run_logger.error("注册失败 | round=%s | error=%s", current_round, error)
             finally:
                 restart_browser()
 
