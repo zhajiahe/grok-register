@@ -8,6 +8,7 @@
     "duckmail_exclude_domains": ["duckmail.sbs"],
     "proxy": "",
     "browser_proxy": "",
+    "browser_proxies": [],
     "api": {
         "endpoint": "",
         "token": "",
