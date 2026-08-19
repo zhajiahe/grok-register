@@ -1522,6 +1522,9 @@ def main():
             except Exception as error:
                 fail_count += 1
                 print(f"[Error] 第 {current_round} 轮失败: {error}")
+                err_text = str(error)
+                if any(marker in err_text for marker in ("Turnstile", "未找到最终注册表单", "人机", "Cloudflare")):
+                    mark_proxy_dead(err_text.split("\n", 1)[0][:120])
                 if run_logger:
                     run_logger.error("注册失败 | round=%s | proxy=%s | error=%s", current_round, _browser_proxy, error)
             finally:
