@@ -12,6 +12,9 @@
     "api": {
         "endpoint": "",
         "token": "",
-        "append": true
+        "append": true,
+        "base": "",
+        "admin_username": "",
+        "admin_password": ""
     }
 }

@@ -33,7 +33,9 @@ cp config.example.json config.json
 | `proxy` | 仅 DuckMail API 走代理 |
 | `browser_proxy` | 单条浏览器代理 |
 | `browser_proxies` | 浏览器代理池，每轮轮询；失败（连不上或 Turnstile 不过）自动跳过 |
-| `api.*` | grok2api 推送，`endpoint` 为空则跳过 |
+| `api.base` | 新版 grok2api 根地址，如 `http://127.0.0.1:8000` |
+| `api.admin_username` / `api.admin_password` | 新版管理端账号，填了则走 `/accounts/web/import` |
+| `api.endpoint` / `api.token` | 旧版 Python grok2api 的 `ssoBasic` 接口；新版填了 `base` 时忽略 |
 
 代理写成 `http://host:port`。SOCKS 对当前 Chrome 启动不稳定，优先 HTTP。`proxy` 和 `browser_proxies` 分开：邮箱 API 不要走不可信的浏览器出口。
 
@@ -45,7 +47,7 @@ DuckMail Token：登录 [duckmail.sbs](https://duckmail.sbs) → F12 Network →
 python3 DrissionPage_example.py
 python3 DrissionPage_example.py --count 50
 python3 DrissionPage_example.py --count 0
-python3 DrissionPage_example.py --count 1000 --output sso/sso_batch.txt
+python3 DrissionPage_example.py --push-sso sso/sso_batch.txt
 ```
 
 无 `DISPLAY` 时自动起 Xvfb。强制 / 关闭：
@@ -55,7 +57,16 @@ USE_XVFB=1 python3 DrissionPage_example.py
 DISABLE_XVFB=1 python3 DrissionPage_example.py
 ```
 
-## 输出
+## grok2api
+
+新版（Go）填 `api.base` + 管理员账号，注册成功后会调用 `/api/admin/v1/accounts/web/import`。也可单独导入已有文件：
+
+```bash
+python3 DrissionPage_example.py --push-sso sso/sso_batch.txt
+```
+
+旧版 Python grok2api 仍用 `api.endpoint` + `api.token`（`ssoBasic`）。两种都配时优先新版。
+
 
 - `sso/sso_<时间>.txt`：一行一个 sso（可用 `--output` 指定）
 - `logs/run_<时间>.log`：每轮邮箱、密码、代理、成败
