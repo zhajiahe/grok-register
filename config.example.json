@@ -4,6 +4,8 @@
     },
     "duckmail_api_base": "https://api.duckmail.sbs",
     "duckmail_bearer": "<your_duckmail_bearer_token>",
+    "duckmail_domains": [],
+    "duckmail_exclude_domains": ["duckmail.sbs"],
     "proxy": "",
     "browser_proxy": "",
     "api": {

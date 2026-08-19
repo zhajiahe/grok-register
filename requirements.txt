@@ -1,2 +1,2 @@
-DrissionPage==4.1.0.9
+DrissionPage>=4.1.1.2,<4.2
 curl_cffi>=0.7.0

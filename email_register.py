@@ -32,6 +32,14 @@ if _config_path.exists():
 DUCKMAIL_API_BASE = str(_conf.get("duckmail_api_base", "https://api.duckmail.sbs"))
 DUCKMAIL_BEARER = str(_conf.get("duckmail_bearer", ""))
 PROXY = str(_conf.get("proxy", ""))
+# x.ai 已拦截 duckmail.sbs；默认从 API 拉其它已验证域名。
+_configured_domains = _conf.get("duckmail_domains") or []
+DUCKMAIL_DOMAINS = [str(d).strip().lstrip("@").lower() for d in _configured_domains if str(d).strip()]
+_configured_exclude = _conf.get("duckmail_exclude_domains")
+if _configured_exclude is None:
+    DUCKMAIL_EXCLUDE_DOMAINS = {"duckmail.sbs"}
+else:
+    DUCKMAIL_EXCLUDE_DOMAINS = {str(d).strip().lstrip("@").lower() for d in _configured_exclude if str(d).strip()}
 
 # ============================================================
 # 适配层：为 DrissionPage_example.py 提供简单接口
@@ -40,19 +48,21 @@ PROXY = str(_conf.get("proxy", ""))
 _temp_email_cache: Dict[str, str] = {}
 
 
-def get_email_and_token() -> Tuple[Optional[str], Optional[str]]:
+def get_email_and_token(
+    exclude_domains: Optional[List[str]] = None,
+) -> Tuple[Optional[str], Optional[str]]:
     """
     创建 DuckMail 临时邮箱并返回 (email, mail_token)。
     供 DrissionPage_example.py 调用。
     """
-    email, _password, mail_token = create_temp_email()
+    email, _password, mail_token = create_temp_email(exclude_domains=exclude_domains)
     if email and mail_token:
         _temp_email_cache[email] = mail_token
         return email, mail_token
     return None, None
 
 
-def get_oai_code(dev_token: str, email: str, timeout: int = 30) -> Optional[str]:
+def get_oai_code(dev_token: str, email: str, timeout: int = 90) -> Optional[str]:
     """
     轮询 DuckMail 获取 OTP 验证码。
     供 DrissionPage_example.py 调用。
@@ -121,15 +131,92 @@ def _generate_password(length=14):
     return "".join(pwd)
 
 
-def create_temp_email() -> Tuple[str, str, str]:
+def _fetch_domain_records(exclude_domains: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """从 DuckMail /domains 拉取已验证域名记录（含 ownerId），默认排除 duckmail.sbs。"""
+    excluded = {d.lower() for d in DUCKMAIL_EXCLUDE_DOMAINS}
+    if exclude_domains:
+        excluded.update(str(d).strip().lstrip("@").lower() for d in exclude_domains if d)
+
+    if DUCKMAIL_DOMAINS:
+        records = [{"domain": d, "ownerId": True, "isVerified": True} for d in DUCKMAIL_DOMAINS if d not in excluded]
+        if records:
+            return records
+
+    if not DUCKMAIL_BEARER:
+        raise Exception("duckmail_bearer 未设置，无法获取邮箱域名")
+
+    api_base = DUCKMAIL_API_BASE.rstrip("/")
+    bearer_headers = {"Authorization": f"Bearer {DUCKMAIL_BEARER}"}
+    session, use_cffi = _create_duckmail_session()
+    found: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    page = 1
+    while page <= 10:
+        res = _do_request(
+            session, use_cffi, "get",
+            f"{api_base}/domains",
+            headers=bearer_headers,
+            params={"page": page},
+            timeout=15,
+        )
+        if res.status_code != 200:
+            raise Exception(f"获取邮箱域名失败: {res.status_code} - {res.text[:200]}")
+        data = res.json() if res.text else {}
+        members = data.get("hydra:member") or data.get("member") or data.get("data") or []
+        for item in members:
+            if not isinstance(item, dict):
+                continue
+            domain = str(item.get("domain") or "").strip().lstrip("@").lower()
+            if not domain or domain in excluded or domain in seen:
+                continue
+            if item.get("isVerified") is False:
+                continue
+            seen.add(domain)
+            found.append({
+                "domain": domain,
+                "ownerId": item.get("ownerId"),
+                "isVerified": item.get("isVerified") is not False,
+            })
+        total = data.get("hydra:totalItems")
+        if not members:
+            break
+        if isinstance(total, int) and page * 30 >= total:
+            break
+        page += 1
+
+    if not found:
+        raise Exception("DuckMail 没有可用的已验证域名（duckmail.sbs 已被 x.ai 拒绝）")
+    return found
+
+
+def list_email_domains(exclude_domains: Optional[List[str]] = None) -> List[str]:
+    """从 DuckMail /domains 拉取已验证域名，默认排除 duckmail.sbs。"""
+    return [str(item["domain"]) for item in _fetch_domain_records(exclude_domains=exclude_domains)]
+
+
+def pick_email_domain(exclude_domains: Optional[List[str]] = None) -> str:
+    # 对齐 AaronL725：优先用带 ownerId 的已验证私有域名，再回落到其它已验证域名。
+    records = _fetch_domain_records(exclude_domains=exclude_domains)
+    private = [item for item in records if item.get("ownerId")]
+    pool = private or records
+    domain = str(random.choice(pool)["domain"])
+    if private:
+        print(f"[*] DuckMail 选用私有域名: {domain}（ownerId 优先，候选 {len(private)} 个）")
+    else:
+        print(f"[*] DuckMail 选用已验证域名: {domain}（候选 {len(pool)} 个）")
+    return domain
+
+
+def create_temp_email(exclude_domains: Optional[List[str]] = None) -> Tuple[str, str, str]:
     """创建 DuckMail 临时邮箱，返回 (email, password, mail_token)"""
     if not DUCKMAIL_BEARER:
         raise Exception("duckmail_bearer 未设置，无法创建临时邮箱")
 
+    domain = pick_email_domain(exclude_domains=exclude_domains)
     chars = string.ascii_lowercase + string.digits
     length = random.randint(8, 13)
     email_local = "".join(random.choice(chars) for _ in range(length))
-    email = f"{email_local}@duckmail.sbs"
+    email = f"{email_local}@{domain}"
     password = _generate_password()
 
     api_base = DUCKMAIL_API_BASE.rstrip("/")
