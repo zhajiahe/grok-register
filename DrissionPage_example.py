@@ -19,7 +19,7 @@ def setup_run_logger() -> logging.Logger:
     log_dir = os.path.join(os.path.dirname(__file__), "logs")
     os.makedirs(log_dir, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = os.path.join(log_dir, f"run_{ts}.log")
+    log_path = os.path.join(log_dir, f"run_{ts}_{os.getpid()}.log")
 
     logger = logging.getLogger("grok_register")
     logger.setLevel(logging.INFO)
@@ -363,12 +363,19 @@ def open_signup_page():
     # 每轮开始时打开注册页，并切到“使用邮箱注册”流程。
     global page
     refresh_active_page()
-    try:
-        page.get(SIGNUP_URL)
-    except Exception:
-        refresh_active_page()
-        page = browser.new_tab(SIGNUP_URL)
-    click_email_signup_button()
+    last_error = None
+    for attempt in range(3):
+        try:
+            page.get(SIGNUP_URL)
+            time.sleep(0.6)
+            click_email_signup_button(timeout=15)
+            return
+        except Exception as exc:
+            last_error = exc
+            print(f"[Debug] 打开注册页失败({attempt + 1}/3): {exc}")
+            refresh_active_page()
+            time.sleep(0.8)
+    raise Exception(f"打开注册页失败: {last_error}")
 
 
 def close_current_page():
@@ -392,11 +399,12 @@ return !!(givenInput && familyInput && passwordInput);
         return False
 
 
-def click_email_signup_button(timeout=10):
+def click_email_signup_button(timeout=15):
     # 页面打开后，自动点击“使用邮箱注册”按钮。
     deadline = time.time() + timeout
     while time.time() < deadline:
-        clicked = page.run_js(r"""
+        try:
+            clicked = page.run_js(r"""
 const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'));
 const target = candidates.find((node) => {
     const text = (node.innerText || node.textContent || '').replace(/\s+/g, '').toLowerCase();
@@ -409,7 +417,11 @@ if (!target) {
 
 target.click();
 return true;
-        """)
+            """)
+        except Exception:
+            refresh_active_page()
+            time.sleep(0.5)
+            continue
 
         if clicked:
             return True
@@ -1775,6 +1787,11 @@ def run_batch_rounds(count, output_path, extract_numbers=False, worker_id=None):
 def _mp_worker_main(worker_id, count, output_path, extract_numbers, proxies, result_queue):
     global run_logger, _proxy_pool, _proxy_index, _browser_proxy, _proxy_dead
     os.environ["GROK_REGISTER_MP_WORKER"] = "1"
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     run_logger = setup_run_logger()
     _proxy_pool = list(proxies or [])
     _proxy_index = 0
@@ -1810,6 +1827,7 @@ def _run_multiprocess(args):
 
     ctx = mp.get_context("spawn")
     result_queue = ctx.Queue()
+    os.environ["PYTHONUNBUFFERED"] = "1"
     os.environ["GROK_REGISTER_MP_WORKER"] = "1"
     procs = []
     try:
@@ -1827,6 +1845,8 @@ def _run_multiprocess(args):
             proc.start()
             procs.append(proc)
             print(f"[*] 已启动 worker {i}，配额 {quota}，代理 {len(assigned)} 条")
+            if i + 1 < n:
+                time.sleep(2)
     finally:
         os.environ.pop("GROK_REGISTER_MP_WORKER", None)
 
