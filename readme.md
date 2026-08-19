@@ -37,7 +37,7 @@ cp config.example.json config.json
 | `api.admin_username` / `api.admin_password` | 新版管理端账号，填了则走 `/accounts/web/import` |
 | `api.endpoint` / `api.token` | 旧版 Python grok2api 的 `ssoBasic` 接口；新版填了 `base` 时忽略 |
 
-代理写成 `http://host:port`。SOCKS 对当前 Chrome 启动不稳定，优先 HTTP。`proxy` 和 `browser_proxies` 分开：邮箱 API 不要走不可信的浏览器出口。
+代理写成 `http://host:port`。SOCKS 对当前 Chrome 启动不稳定，优先 HTTP。`proxy` 和 `browser_proxies` 分开：邮箱 API 不要走不可信的浏览器出口。非本机 `api.base` 必须 HTTPS。
 
 DuckMail Token：登录 [duckmail.sbs](https://duckmail.sbs) → F12 Network → 复制发往 `api.duckmail.sbs` 的 `Authorization: Bearer ...`。
 
@@ -59,7 +59,9 @@ DISABLE_XVFB=1 python3 DrissionPage_example.py
 
 ## grok2api
 
-新版（Go）填 `api.base` + 管理员账号，注册成功后会调用 `/api/admin/v1/accounts/web/import`。也可单独导入已有文件：
+本脚本导入的是 **Grok Web SSO**，不是 Grok Build，也不是 xAI 官方 API Key。
+
+新版（Go）填 `api.base` + 管理员账号，每轮注册成功后调用 `/api/admin/v1/accounts/web/import`。也可只导入已有文件：
 
 ```bash
 python3 DrissionPage_example.py --push-sso sso/sso_batch.txt
@@ -67,6 +69,23 @@ python3 DrissionPage_example.py --push-sso sso/sso_batch.txt
 
 旧版 Python grok2api 仍用 `api.endpoint` + `api.token`（`ssoBasic`）。两种都配时优先新版。
 
+### 模型和 grok-4.6
+
+| 调用名 | 实际来源 |
+| --- | --- |
+| `grok-chat-fast` | grok.com **Fast** 档。网页会换底层，不是官方 API 的 `grok-4.6` |
+| `grok-chat-auto` / `expert` / `heavy` | 网页 Auto / Expert / Heavy，分别要 Super / Heavy 订阅 |
+| `grok-4.6` | Grok **Build** 或 Console。当前旗舰，需 Build OAuth 账号 |
+
+刚导入 Web 号时，`GET /v1/models` 通常只有 `grok-chat-fast` 和 Imagine。要 `grok-4.6`：
+
+1. 管理端把 Web 转成 Build：`POST /api/admin/v1/accounts/web/convert-to-build`，body `{"all": true, "strategy": "missing"}`（也可用管理界面）
+2. 客户端密钥的 `providerScope` 包含 `grok_build`（只开 `grok_web` 时列表里看不到 4.6）
+3. 给 `grok_build` 配出口节点；可与 Web 共用同一条 HTTP 代理，fallback 指过去
+
+然后 `model` 用 `grok-4.6`。推理档：`grok-4.6-low` / `-medium` / `-high` / `-xhigh`。
+
+## 产出
 
 - `sso/sso_<时间>.txt`：一行一个 sso（可用 `--output` 指定）
 - `logs/run_<时间>.log`：每轮邮箱、密码、代理、成败
@@ -76,6 +95,7 @@ python3 DrissionPage_example.py --push-sso sso/sso_batch.txt
 - **邮箱域名被拒**：已默认跳过 `duckmail.sbs`，被拒会换域重试。也可在 `duckmail_domains` 里写自己的已验证域名。
 - **Turnstile token 一直为 0**：出口 IP 被 Cloudflare 打分过低。换住宅代理，或在本地有桌面的机器上跑。
 - **Chrome 起不来**：确认是系统 Chrome，且不要手动给 DrissionPage 设 `user-data-path`（4.1.1 会清掉 `auto_port`）。
+- **chat 没有 grok-4.6**：先确认 SSO 已进 grok2api Web，再转 Build，并让客户端密钥包含 `grok_build`。
 
 ## 致谢
 
