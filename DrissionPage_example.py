@@ -72,9 +72,10 @@ def warn_runtime_compatibility():
 ensure_stable_python_runtime()
 warn_runtime_compatibility()
 
-# 无头服务器自动启用 Xvfb 虚拟显示器
+# 无头服务器 / Cloud Agent 的 VNC 桌面容易被 Cloudflare 判成交互验证，优先用 Xvfb。
 _virtual_display = None
-if not os.environ.get("DISPLAY") or os.environ.get("USE_XVFB") == "1":
+_force_xvfb = os.environ.get("USE_XVFB") == "1" or bool(os.environ.get("CURSOR_AGENT"))
+if os.environ.get("DISABLE_XVFB") != "1" and (not os.environ.get("DISPLAY") or _force_xvfb):
     try:
         from pyvirtualdisplay import Display
         _virtual_display = Display(visible=0, size=(1920, 1080))
@@ -89,6 +90,8 @@ co.set_argument("--no-sandbox")
 co.set_argument("--disable-gpu")
 co.set_argument("--disable-dev-shm-usage")
 co.set_argument("--disable-software-rasterizer")
+co.set_argument("--disable-blink-features=AutomationControlled")
+co.set_argument("--window-size=1920,1080")
 
 # 从 config.json 读取代理配置给浏览器
 _browser_proxy = ""
@@ -732,42 +735,75 @@ return { url: location.href, inputs, buttons };
 
 
 def getTurnstileToken():
-    # 复用现有 turnstile 处理逻辑，在最终注册页需要时再触发。
-    page.run_js("try { turnstile.reset() } catch(e) { }")
-
-    turnstileResponse = None
-
-    for i in range(0, 15):
+    # 先等 Turnstile 自动出 token；不行再点 checkbox。Cloud Agent 下配合 Xvfb 降低交互验证概率。
+    def _read_token():
         try:
-            turnstileResponse = page.run_js("try { return turnstile.getResponse() } catch(e) { return null }")
-            if turnstileResponse:
-                return turnstileResponse
+            token = page.run_js("try { return turnstile.getResponse() } catch(e) { return null }")
+            if token:
+                return token
+        except Exception:
+            pass
+        try:
+            value = page.run_js(
+                """
+const input = document.querySelector('input[name="cf-turnstile-response"]');
+return input ? String(input.value || '').trim() : '';
+                """
+            )
+            return value or None
+        except Exception:
+            return None
 
-            challengeSolution = page.ele("@name=cf-turnstile-response")
+    for _ in range(8):
+        token = _read_token()
+        if token:
+            print("[*] Turnstile 已自动通过。")
+            return token
+        time.sleep(0.5)
+
+    last_error = ""
+    for i in range(20):
+        token = _read_token()
+        if token:
+            print("[*] Turnstile 点击后已拿到响应。")
+            return token
+        try:
+            challengeSolution = page.ele("@name=cf-turnstile-response", timeout=3)
             challengeWrapper = challengeSolution.parent()
-            challengeIframe = challengeWrapper.shadow_root.ele("tag:iframe")
-
+            challengeIframe = challengeWrapper.shadow_root.ele("tag:iframe", timeout=3)
             challengeIframe.run_js("""
 window.dtp = 1
 function getRandomInt(min, max) {
     return Math.floor(Math.random() * (max - min + 1)) + min;
 }
-
-// 旧方案在 4K 屏下不稳定，这里给出更自然的屏幕坐标。
 let screenX = getRandomInt(800, 1200);
 let screenY = getRandomInt(400, 600);
-
 Object.defineProperty(MouseEvent.prototype, 'screenX', { value: screenX });
 Object.defineProperty(MouseEvent.prototype, 'screenY', { value: screenY });
-                        """)
-
-            challengeIframeBody = challengeIframe.ele("tag:body").shadow_root
-            challengeButton = challengeIframeBody.ele("tag:input")
-            challengeButton.click()
-        except:
-            pass
+            """)
+            challengeIframeBody = challengeIframe.ele("tag:body", timeout=3).shadow_root
+            challengeButton = None
+            try:
+                challengeButton = challengeIframeBody.ele("css:input[type=checkbox]", timeout=3)
+            except Exception:
+                try:
+                    challengeButton = challengeIframeBody.ele("tag:input", timeout=3)
+                except Exception:
+                    challengeButton = None
+            if challengeButton:
+                challengeButton.click()
+            try:
+                label = challengeIframeBody.ele("tag:label", timeout=1)
+                label.click()
+            except Exception:
+                pass
+            if i == 0 or i % 5 == 4:
+                print(f"[*] 正在点击 Turnstile checkbox ({i + 1}/20)")
+        except Exception as error:
+            last_error = str(error)
         time.sleep(1)
-    raise Exception("failed to solve turnstile")
+
+    raise Exception(f"failed to solve turnstile{': ' + last_error if last_error else ''}")
 
 
 def build_profile():
