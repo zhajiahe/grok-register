@@ -27,6 +27,7 @@ cp config.example.json config.json
 | 字段 | 说明 |
 | --- | --- |
 | `run.count` | 轮数，`0` 为无限；可被 `--count` 覆盖 |
+| `run.workers` | 并行 Chrome 进程数，默认 `1`；可被 `--workers` 覆盖。4 核机器建议 2–3 |
 | `duckmail_bearer` | DuckMail Token |
 | `duckmail_domains` | 指定邮箱域名；空则从 API 拉已验证域名 |
 | `duckmail_exclude_domains` | 默认排除 `duckmail.sbs`（x.ai 会拒） |
@@ -47,8 +48,11 @@ DuckMail Token：登录 [duckmail.sbs](https://duckmail.sbs) → F12 Network →
 python3 DrissionPage_example.py
 python3 DrissionPage_example.py --count 50
 python3 DrissionPage_example.py --count 0
+python3 DrissionPage_example.py --count 3000 --workers 3 --output sso/sso_batch_3000.txt
 python3 DrissionPage_example.py --push-sso sso/sso_batch.txt
 ```
+
+成功一轮后会清 cookie 复用同一个 Chrome 和代理，失败（Turnstile / 连不上）才换代理并重启浏览器。`--workers` 会按进程切分代理池，互不抢同一条出口。
 
 无 `DISPLAY` 时自动起 Xvfb。强制 / 关闭：
 

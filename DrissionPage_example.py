@@ -1,7 +1,9 @@
 from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
 import argparse
+import fcntl
 import glob as _glob_mod
+import multiprocessing as mp
 import platform
 import datetime
 import logging
@@ -73,9 +75,14 @@ ensure_stable_python_runtime()
 warn_runtime_compatibility()
 
 # 无头服务器 / Cloud Agent 的 VNC 桌面容易被 Cloudflare 判成交互验证，优先用 Xvfb。
+# 多进程 worker 继承父进程 DISPLAY，不要再起一套 Xvfb。
 _virtual_display = None
 _skip_browser = any(arg == "--push-sso" or arg.startswith("--push-sso=") for arg in sys.argv[1:])
-_force_xvfb = os.environ.get("USE_XVFB") == "1" or bool(os.environ.get("CURSOR_AGENT"))
+_is_mp_worker = (
+    os.environ.get("GROK_REGISTER_MP_WORKER") == "1"
+    or mp.current_process().name != "MainProcess"
+)
+_force_xvfb = (os.environ.get("USE_XVFB") == "1" or bool(os.environ.get("CURSOR_AGENT"))) and not _is_mp_worker
 if (not _skip_browser) and os.environ.get("DISABLE_XVFB") != "1" and (not os.environ.get("DISPLAY") or _force_xvfb):
     try:
         from pyvirtualdisplay import Display
@@ -171,7 +178,8 @@ def _preflight_proxy_pool(proxies: list) -> list:
     return proxies
 
 
-def select_browser_proxy() -> str:
+def select_browser_proxy(force_rotate: bool = False) -> str:
+    # 成功轮次粘滞当前代理，避免每轮换 IP 还要重启 Chrome。
     global _browser_proxy, _proxy_index
     alive = [item for item in _proxy_pool if item not in _proxy_dead]
     if not alive:
@@ -182,6 +190,8 @@ def select_browser_proxy() -> str:
     if not alive:
         _browser_proxy = ""
         return ""
+    if _browser_proxy and _browser_proxy in alive and not force_rotate:
+        return _browser_proxy
     proxy = alive[_proxy_index % len(alive)]
     _proxy_index += 1
     _browser_proxy = proxy
@@ -256,13 +266,13 @@ _sso_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 DEFAULT_SSO_FILE = os.path.join(_sso_dir, f"sso_{_sso_ts}.txt")
 
 
-def start_browser():
-    # 对齐参考实现：每次启动都新建 ChromiumOptions；代理池按轮询切换，失败则换下一条。
+def start_browser(force_rotate: bool = False):
+    # 对齐参考实现：每次启动都新建 ChromiumOptions；失败才换代理。
     global browser, page
     last_exc = None
     attempts = max(4, len(_proxy_pool) or 1)
     for attempt in range(1, attempts + 1):
-        select_browser_proxy()
+        select_browser_proxy(force_rotate=force_rotate or attempt > 1)
         try:
             browser = Chromium(create_browser_options())
             tabs = browser.get_tabs()
@@ -300,10 +310,37 @@ def stop_browser():
     page = None
 
 
-def restart_browser():
-    # 对齐参考实现：每轮完整停掉再拉起，避免 SSO / Turnstile 状态串轮。
+def restart_browser(force_rotate: bool = True):
+    # 失败换代理时完整重启；成功轮次优先 reset_signup_session。
     stop_browser()
-    start_browser()
+    start_browser(force_rotate=force_rotate)
+
+
+def reset_signup_session():
+    # 成功后清 cookie / storage，复用同一 Chrome 和代理，比整轮 quit 快。
+    global page
+    try:
+        if page is not None:
+            try:
+                page.set.cookies.clear()
+            except Exception:
+                pass
+            try:
+                page.run_js("try { localStorage.clear(); sessionStorage.clear(); } catch (e) {}")
+            except Exception:
+                pass
+        if browser is not None:
+            try:
+                browser.set.cookies.clear()
+            except Exception:
+                pass
+        refresh_active_page()
+        if page is not None:
+            page.get("about:blank")
+        return
+    except Exception as exc:
+        print(f"[Debug] 会话重置失败，改为重启浏览器: {exc}")
+        restart_browser(force_rotate=False)
 
 
 def refresh_active_page():
@@ -1151,7 +1188,7 @@ return value.length >= 80 ? 'ready' : ('pending:' + value.length);
                 if wait_cf_since is None:
                     wait_cf_since = now
                     print(f"[*] 资料已填写，等待 Cloudflare 自动通过... 当前token长度={token_len}")
-                if now - wait_cf_since >= 12 and now - last_cf_retry_at >= 8:
+                if now - wait_cf_since >= 7 and now - last_cf_retry_at >= 5:
                     print("[*] Cloudflare 验证卡住，开始二次复用 Turnstile...")
                     try:
                         turnstile_token = getTurnstileToken()
@@ -1349,9 +1386,16 @@ def append_sso_to_txt(sso_value, output_path=DEFAULT_SSO_FILE):
     if not normalized:
         raise Exception("待写入的 sso 为空")
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    parent_dir = os.path.dirname(os.path.abspath(output_path))
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
     with open(output_path, "a", encoding="utf-8") as file:
-        file.write(normalized + "\n")
+        fcntl.flock(file.fileno(), fcntl.LOCK_EX)
+        try:
+            file.write(normalized + "\n")
+            file.flush()
+        finally:
+            fcntl.flock(file.fileno(), fcntl.LOCK_UN)
 
     print(f"[*] 已追加写入 sso 到文件: {output_path}")
 
@@ -1624,19 +1668,190 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
     return result
 
 
-def load_run_count() -> int:
-    # 从 config.json 读取默认执行轮数，配置不存在时返回 10。
+def _load_run_section() -> dict:
     config_path = os.path.join(os.path.dirname(__file__), "config.json")
     try:
         import json
         with open(config_path, "r", encoding="utf-8") as f:
             conf = json.load(f)
-        v = conf.get("run", {}).get("count")
-        if isinstance(v, int) and v >= 0:
-            return v
+        section = conf.get("run") or {}
+        return section if isinstance(section, dict) else {}
     except Exception:
-        pass
+        return {}
+
+
+def load_run_count() -> int:
+    # 从 config.json 读取默认执行轮数，配置不存在时返回 10。
+    v = _load_run_section().get("count")
+    if isinstance(v, int) and v >= 0:
+        return v
     return 10
+
+
+def load_run_workers() -> int:
+    v = _load_run_section().get("workers")
+    if isinstance(v, int) and v >= 1:
+        return v
+    return 1
+
+
+def run_batch_rounds(count, output_path, extract_numbers=False, worker_id=None):
+    # 单进程内循环注册。成功则清会话复用 Chrome；失败才换代理并重启。
+    collected_sso: list = []
+    success_count = 0
+    fail_count = 0
+    current_round = 0
+    prefix = f"[W{worker_id}] " if worker_id is not None else ""
+
+    try:
+        start_browser()
+        reuse_ok = False
+        while True:
+            if count > 0 and current_round >= count:
+                break
+
+            current_round += 1
+            print(f"\n[*] {prefix}开始第 {current_round} 轮注册（成功 {success_count} / 失败 {fail_count}）")
+            more_rounds = count == 0 or current_round < count
+            reuse_ok = False
+
+            try:
+                result = run_single_registration(output_path, extract_numbers=extract_numbers)
+                collected_sso.append(result["sso"])
+                success_count += 1
+                reuse_ok = True
+                try:
+                    push_sso_to_api([result["sso"]])
+                except Exception as push_exc:
+                    print(f"[Warn] {prefix}本轮推送 grok2api 失败: {push_exc}")
+            except KeyboardInterrupt:
+                print(f"\n[Info] {prefix}收到中断信号，停止后续轮次。")
+                break
+            except Exception as error:
+                fail_count += 1
+                print(f"[Error] {prefix}第 {current_round} 轮失败: {error}")
+                err_text = str(error)
+                if any(marker in err_text for marker in ("Turnstile", "未找到最终注册表单", "人机", "Cloudflare")):
+                    mark_proxy_dead(err_text.split("\n", 1)[0][:120])
+                if run_logger:
+                    run_logger.error(
+                        "注册失败 | round=%s | worker=%s | proxy=%s | error=%s",
+                        current_round,
+                        worker_id,
+                        _browser_proxy,
+                        error,
+                    )
+            finally:
+                if more_rounds:
+                    if reuse_ok:
+                        try:
+                            reset_signup_session()
+                        except Exception as reset_exc:
+                            print(f"[Warn] {prefix}会话重置失败，改为重启浏览器: {reset_exc}")
+                            restart_browser(force_rotate=False)
+                    else:
+                        restart_browser(force_rotate=True)
+
+            if more_rounds:
+                time.sleep(0.3 if reuse_ok else 0.5)
+        print(f"\n[*] {prefix}本批结束：成功 {success_count}，失败 {fail_count}，共 {current_round} 轮")
+        return success_count, fail_count, collected_sso
+    finally:
+        try:
+            api_conf = _load_api_config()
+        except Exception:
+            api_conf = {}
+        go_mode = bool(
+            str(api_conf.get("base") or "").strip()
+            and str(api_conf.get("admin_username") or "").strip()
+            and api_conf.get("admin_password")
+        )
+        if collected_sso and not go_mode:
+            print(f"\n[*] {prefix}注册完成，推送 {len(collected_sso)} 个 token 到旧版 API...")
+            push_sso_to_api(collected_sso)
+        stop_browser()
+
+
+def _mp_worker_main(worker_id, count, output_path, extract_numbers, proxies, result_queue):
+    global run_logger, _proxy_pool, _proxy_index, _browser_proxy, _proxy_dead
+    os.environ["GROK_REGISTER_MP_WORKER"] = "1"
+    run_logger = setup_run_logger()
+    _proxy_pool = list(proxies or [])
+    _proxy_index = 0
+    _browser_proxy = ""
+    _proxy_dead = set()
+    print(f"[W{worker_id}] 启动，配额 {count} 轮，代理 {len(_proxy_pool)} 条")
+    success = fail = 0
+    try:
+        success, fail, _ = run_batch_rounds(
+            count,
+            output_path,
+            extract_numbers=extract_numbers,
+            worker_id=worker_id,
+        )
+    except KeyboardInterrupt:
+        print(f"[W{worker_id}] 收到中断")
+    except Exception as exc:
+        print(f"[W{worker_id}] 进程异常: {exc}")
+        if run_logger:
+            run_logger.exception("worker 异常")
+    finally:
+        try:
+            result_queue.put((worker_id, success, fail))
+        except Exception:
+            pass
+
+
+def _run_multiprocess(args):
+    n = args.workers
+    counts = [args.count // n] * n
+    for i in range(args.count % n):
+        counts[i] += 1
+
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    os.environ["GROK_REGISTER_MP_WORKER"] = "1"
+    procs = []
+    try:
+        for i, quota in enumerate(counts):
+            if quota <= 0:
+                continue
+            assigned = _proxy_pool[i::n] if _proxy_pool else []
+            if _proxy_pool and not assigned:
+                assigned = list(_proxy_pool)
+            proc = ctx.Process(
+                target=_mp_worker_main,
+                args=(i, quota, args.output, args.extract_numbers, assigned, result_queue),
+                name=f"register-w{i}",
+            )
+            proc.start()
+            procs.append(proc)
+            print(f"[*] 已启动 worker {i}，配额 {quota}，代理 {len(assigned)} 条")
+    finally:
+        os.environ.pop("GROK_REGISTER_MP_WORKER", None)
+
+    try:
+        for proc in procs:
+            proc.join()
+    except KeyboardInterrupt:
+        print("\n[Info] 收到中断，正在结束各 worker...")
+        for proc in procs:
+            proc.terminate()
+        for proc in procs:
+            proc.join(timeout=8)
+
+    total_success = total_fail = 0
+    finished = 0
+    while finished < len(procs):
+        try:
+            worker_id, success, fail = result_queue.get(timeout=3)
+        except Exception:
+            break
+        finished += 1
+        total_success += success
+        total_fail += fail
+        print(f"[*] worker {worker_id} 结束：成功 {success}，失败 {fail}")
+    print(f"\n[*] 全部进程结束：成功 {total_success}，失败 {total_fail}，目标 {args.count}")
 
 
 def main():
@@ -1651,6 +1866,12 @@ def main():
     parser.add_argument("--output", default=DEFAULT_SSO_FILE, help="sso 输出 txt 路径")
     parser.add_argument("--extract-numbers", action="store_true", help="注册完成后额外提取页面数字文本")
     parser.add_argument("--push-sso", default="", help="只把已有 sso txt（一行一个）导入 grok2api，不跑注册")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=load_run_workers(),
+        help="并行浏览器进程数（默认读取 config.json run.workers，本机建议 2–3）",
+    )
     args = parser.parse_args()
 
     if args.push_sso:
@@ -1661,67 +1882,22 @@ def main():
         push_sso_to_api(tokens)
         return
 
-    current_round = 0
-    collected_sso: list = []
-    success_count = 0
-    fail_count = 0
+    if args.workers < 1:
+        raise SystemExit("--workers 必须 >= 1")
+    if args.workers > 1 and args.count <= 0:
+        raise SystemExit("多进程模式必须指定 --count（不支持无限循环）")
+
     if _proxy_pool:
         _proxy_pool = _preflight_proxy_pool(_proxy_pool)
         if run_logger:
             run_logger.info("代理池预检后剩余 %s 条", len(_proxy_pool))
-    try:
-        start_browser()
-        while True:
-            if args.count > 0 and current_round >= args.count:
-                break
 
-            current_round += 1
-            print(f"\n[*] 开始第 {current_round} 轮注册（成功 {success_count} / 失败 {fail_count}）")
-            more_rounds = args.count == 0 or current_round < args.count
+    if args.workers > 1:
+        print(f"[*] 多进程注册：workers={args.workers} count={args.count}")
+        _run_multiprocess(args)
+        return
 
-            try:
-                result = run_single_registration(args.output, extract_numbers=args.extract_numbers)
-                collected_sso.append(result["sso"])
-                success_count += 1
-                try:
-                    push_sso_to_api([result["sso"]])
-                except Exception as push_exc:
-                    print(f"[Warn] 本轮推送 grok2api 失败: {push_exc}")
-            except KeyboardInterrupt:
-                print("\n[Info] 收到中断信号，停止后续轮次。")
-                break
-            except Exception as error:
-                fail_count += 1
-                print(f"[Error] 第 {current_round} 轮失败: {error}")
-                err_text = str(error)
-                if any(marker in err_text for marker in ("Turnstile", "未找到最终注册表单", "人机", "Cloudflare")):
-                    mark_proxy_dead(err_text.split("\n", 1)[0][:120])
-                if run_logger:
-                    run_logger.error("注册失败 | round=%s | proxy=%s | error=%s", current_round, _browser_proxy, error)
-            finally:
-                if more_rounds:
-                    restart_browser()
-
-            if more_rounds:
-                time.sleep(2)
-        print(f"\n[*] 本批结束：成功 {success_count}，失败 {fail_count}，共 {current_round} 轮")
-
-    finally:
-        # 新版 grok2api 已在每轮成功后增量导入；这里只给旧版 ssoBasic 做收尾全量推送。
-        try:
-            api_conf = _load_api_config()
-        except Exception:
-            api_conf = {}
-        go_mode = bool(
-            str(api_conf.get("base") or "").strip()
-            and str(api_conf.get("admin_username") or "").strip()
-            and api_conf.get("admin_password")
-        )
-        if collected_sso and not go_mode:
-            print(f"\n[*] 注册完成，推送 {len(collected_sso)} 个 token 到旧版 API...")
-            push_sso_to_api(collected_sso)
-
-        stop_browser()
+    run_batch_rounds(args.count, args.output, extract_numbers=args.extract_numbers)
 
 
 if __name__ == "__main__":
