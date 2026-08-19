@@ -7,6 +7,7 @@ import multiprocessing as mp
 import platform
 import datetime
 import logging
+import threading
 import time
 import os
 import secrets
@@ -919,7 +920,7 @@ def getTurnstileToken():
         pass
 
     last_error = ""
-    for i in range(20):
+    for i in range(8):
         try:
             if page is None:
                 refresh_active_page()
@@ -979,8 +980,8 @@ const nodes = Array.from(document.querySelectorAll('div,span,iframe')).filter((n
 if (nodes.length && typeof nodes[0].click === 'function') nodes[0].click();
                     """
                 )
-            if i == 0 or i % 5 == 4:
-                print(f"[*] 等待 Turnstile token（{i + 1}/20）")
+            if i == 0 or i % 4 == 3:
+                print(f"[*] 等待 Turnstile token（{i + 1}/8）")
         except PageDisconnectedError as error:
             last_error = str(error)
             print("[Debug] Turnstile 检测时页面断开，刷新标签页后继续")
@@ -1018,7 +1019,7 @@ def build_profile():
     return given_name, family_name, password
 
 
-def fill_profile_and_submit(timeout=120):
+def fill_profile_and_submit(timeout=75):
     # 对齐 AaronL725：资料只填一次，避免反复写入把 Turnstile 冲掉；token 长度>=80 再提交。
     given_name, family_name, password = build_profile()
     deadline = time.time() + timeout
@@ -1707,6 +1708,31 @@ def load_run_workers() -> int:
     return 1
 
 
+BROWSER_RECYCLE_EVERY = 20
+SINGLE_ROUND_TIMEOUT = 150
+
+
+def _run_single_registration_with_timeout(output_path, extract_numbers=False, timeout=SINGLE_ROUND_TIMEOUT):
+    # Chrome/CDP 卡住时 Python 自己的 while 超时不会触发。到点强制 quit。
+    stop_event = threading.Event()
+
+    def _kill_hung_browser():
+        if stop_event.wait(timeout):
+            return
+        print(f"[Warn] 单轮超过 {timeout}s，强制关闭 Chrome")
+        try:
+            stop_browser()
+        except Exception:
+            pass
+
+    watcher = threading.Thread(target=_kill_hung_browser, daemon=True)
+    watcher.start()
+    try:
+        return run_single_registration(output_path, extract_numbers=extract_numbers)
+    finally:
+        stop_event.set()
+
+
 def run_batch_rounds(count, output_path, extract_numbers=False, worker_id=None):
     # 单进程内循环注册。成功则清会话复用 Chrome；失败才换代理并重启。
     collected_sso: list = []
@@ -1728,7 +1754,7 @@ def run_batch_rounds(count, output_path, extract_numbers=False, worker_id=None):
             reuse_ok = False
 
             try:
-                result = run_single_registration(output_path, extract_numbers=extract_numbers)
+                result = _run_single_registration_with_timeout(output_path, extract_numbers=extract_numbers)
                 collected_sso.append(result["sso"])
                 success_count += 1
                 reuse_ok = True
@@ -1743,7 +1769,7 @@ def run_batch_rounds(count, output_path, extract_numbers=False, worker_id=None):
                 fail_count += 1
                 print(f"[Error] {prefix}第 {current_round} 轮失败: {error}")
                 err_text = str(error)
-                if any(marker in err_text for marker in ("Turnstile", "未找到最终注册表单", "人机", "Cloudflare")):
+                if any(marker in err_text for marker in ("Turnstile", "未找到最终注册表单", "人机", "Cloudflare", "超时")):
                     mark_proxy_dead(err_text.split("\n", 1)[0][:120])
                 if run_logger:
                     run_logger.error(
@@ -1755,14 +1781,17 @@ def run_batch_rounds(count, output_path, extract_numbers=False, worker_id=None):
                     )
             finally:
                 if more_rounds:
-                    if reuse_ok:
+                    recycle = reuse_ok and success_count > 0 and success_count % BROWSER_RECYCLE_EVERY == 0
+                    if reuse_ok and not recycle:
                         try:
                             reset_signup_session()
                         except Exception as reset_exc:
                             print(f"[Warn] {prefix}会话重置失败，改为重启浏览器: {reset_exc}")
                             restart_browser(force_rotate=False)
                     else:
-                        restart_browser(force_rotate=True)
+                        if recycle:
+                            print(f"[*] {prefix}已成功 {success_count} 轮，重启 Chrome 防止会话发粘")
+                        restart_browser(force_rotate=not reuse_ok)
 
             if more_rounds:
                 time.sleep(0.3 if reuse_ok else 0.5)
@@ -1794,10 +1823,10 @@ def _mp_worker_main(worker_id, count, output_path, extract_numbers, proxies, res
         pass
     run_logger = setup_run_logger()
     _proxy_pool = list(proxies or [])
-    _proxy_index = 0
+    _proxy_index = int(worker_id or 0)
     _browser_proxy = ""
     _proxy_dead = set()
-    print(f"[W{worker_id}] 启动，配额 {count} 轮，代理 {len(_proxy_pool)} 条")
+    print(f"[W{worker_id}] 启动，配额 {count} 轮，代理 {len(_proxy_pool)} 条，起始序号 {_proxy_index}")
     success = fail = 0
     try:
         success, fail, _ = run_batch_rounds(
@@ -1834,9 +1863,7 @@ def _run_multiprocess(args):
         for i, quota in enumerate(counts):
             if quota <= 0:
                 continue
-            assigned = _proxy_pool[i::n] if _proxy_pool else []
-            if _proxy_pool and not assigned:
-                assigned = list(_proxy_pool)
+            assigned = list(_proxy_pool)
             proc = ctx.Process(
                 target=_mp_worker_main,
                 args=(i, quota, args.output, args.extract_numbers, assigned, result_queue),
@@ -1844,7 +1871,7 @@ def _run_multiprocess(args):
             )
             proc.start()
             procs.append(proc)
-            print(f"[*] 已启动 worker {i}，配额 {quota}，代理 {len(assigned)} 条")
+            print(f"[*] 已启动 worker {i}，配额 {quota}，共享代理 {len(assigned)} 条")
             if i + 1 < n:
                 time.sleep(2)
     finally:
