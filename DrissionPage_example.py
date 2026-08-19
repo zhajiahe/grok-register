@@ -74,8 +74,9 @@ warn_runtime_compatibility()
 
 # 无头服务器 / Cloud Agent 的 VNC 桌面容易被 Cloudflare 判成交互验证，优先用 Xvfb。
 _virtual_display = None
+_skip_browser = any(arg == "--push-sso" or arg.startswith("--push-sso=") for arg in sys.argv[1:])
 _force_xvfb = os.environ.get("USE_XVFB") == "1" or bool(os.environ.get("CURSOR_AGENT"))
-if os.environ.get("DISABLE_XVFB") != "1" and (not os.environ.get("DISPLAY") or _force_xvfb):
+if (not _skip_browser) and os.environ.get("DISABLE_XVFB") != "1" and (not os.environ.get("DISPLAY") or _force_xvfb):
     try:
         from pyvirtualdisplay import Display
         _virtual_display = Display(visible=0, size=(1920, 1080))
@@ -1355,24 +1356,181 @@ def append_sso_to_txt(sso_value, output_path=DEFAULT_SSO_FILE):
     print(f"[*] 已追加写入 sso 到文件: {output_path}")
 
 
+def _load_api_config() -> dict:
+    import json
+    config_path = os.path.join(os.path.dirname(__file__), "config.json")
+    with open(config_path, "r", encoding="utf-8") as handle:
+        conf = json.load(handle)
+    api_conf = dict(conf.get("api") or {})
+    # 兼容 AaronL725 风格的顶层字段。
+    if not api_conf.get("base"):
+        api_conf["base"] = conf.get("grok2api_remote_base", "")
+    if not api_conf.get("admin_username"):
+        api_conf["admin_username"] = conf.get("grok2api_remote_admin_username", "")
+    if not api_conf.get("admin_password"):
+        api_conf["admin_password"] = conf.get("grok2api_remote_admin_password", "")
+    return api_conf
+
+
+def _normalize_sso_token(raw) -> str:
+    value = str(raw or "").strip()
+    if value.lower().startswith("sso="):
+        value = value.split(";", 1)[0][4:].strip()
+    return value.strip().strip("\"'")
+
+
+def _grok2api_go_admin_base(base: str) -> str:
+    import urllib.parse
+    normalized = str(base or "").strip().rstrip("/")
+    if not normalized:
+        return ""
+    for suffix in ("/api/admin/v1", "/admin/api", "/admin"):
+        if normalized.lower().endswith(suffix):
+            normalized = normalized[: -len(suffix)].rstrip("/")
+            break
+    host = (urllib.parse.urlsplit(normalized).hostname or "").lower()
+    if urllib.parse.urlsplit(normalized).scheme == "http" and host not in {"localhost", "127.0.0.1", "::1"}:
+        raise Exception("新版 grok2api 非本机地址必须使用 HTTPS")
+    return normalized + "/api/admin/v1"
+
+
+_grok2api_admin_token = ""
+_grok2api_admin_expires = 0.0
+_grok2api_admin_session = ""
+
+
+def _grok2api_admin_login(api_base: str, username: str, password: str, force: bool = False) -> str:
+    global _grok2api_admin_token, _grok2api_admin_expires, _grok2api_admin_session
+    import hashlib
+    import requests
+
+    session_key = "%s\n%s\n%s" % (api_base, username, hashlib.sha256(password.encode("utf-8")).hexdigest())
+    if (
+        not force
+        and _grok2api_admin_session == session_key
+        and _grok2api_admin_token
+        and _grok2api_admin_expires > time.time() + 30
+    ):
+        return _grok2api_admin_token
+
+    resp = requests.post(
+        api_base + "/auth/login",
+        json={"username": username, "password": password},
+        timeout=30,
+    )
+    if not 200 <= resp.status_code < 300:
+        raise Exception(f"grok2api 管理员登录失败: HTTP {resp.status_code}")
+    tokens = (resp.json().get("data") or {}).get("tokens") or {}
+    token = str(tokens.get("accessToken") or "").strip()
+    if not token:
+        raise Exception("grok2api 登录响应缺少 accessToken")
+    expiry = str(tokens.get("accessTokenExpiresAt") or "").strip()
+    try:
+        expires_at = datetime.datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+        _grok2api_admin_expires = expires_at.timestamp()
+    except Exception:
+        _grok2api_admin_expires = time.time() + 300
+    _grok2api_admin_token = token
+    _grok2api_admin_session = session_key
+    return token
+
+
+def _parse_grok2api_import_sse(text: str) -> dict:
+    import json
+    event = ""
+    completed = None
+    error_message = ""
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if line.startswith("event:"):
+            event = line[6:].strip()
+            continue
+        if not line.startswith("data:"):
+            continue
+        try:
+            data = json.loads(line[5:].strip()) if line[5:].strip().startswith("{") else {}
+        except Exception:
+            data = {}
+        if event == "error":
+            error_message = str((data or {}).get("message") or (data or {}).get("error") or line[5:200])
+        if event == "complete" and isinstance(data, dict):
+            completed = data
+    if error_message:
+        raise Exception("grok2api 导入失败: " + error_message[:200])
+    if completed is None:
+        raise Exception("grok2api 导入响应缺少 complete 事件")
+    return completed
+
+
+def push_sso_to_grok2api_go(new_tokens: list, api_conf: dict) -> bool:
+    import requests
+
+    tokens = [_normalize_sso_token(item) for item in new_tokens]
+    tokens = [item for item in tokens if item]
+    if not tokens:
+        return False
+    api_base = _grok2api_go_admin_base(str(api_conf.get("base") or ""))
+    username = str(api_conf.get("admin_username") or "").strip()
+    password = str(api_conf.get("admin_password") or "")
+    payload = ("\n".join(tokens) + "\n").encode("utf-8")
+    last_error = ""
+    for attempt in range(2):
+        access = _grok2api_admin_login(api_base, username, password, force=attempt > 0)
+        resp = requests.post(
+            api_base + "/accounts/web/import",
+            headers={"Authorization": f"Bearer {access}", "Accept": "text/event-stream"},
+            files={"file": ("grok-web-sso.txt", payload, "text/plain; charset=utf-8")},
+            timeout=120,
+        )
+        if resp.status_code == 401 and attempt == 0:
+            continue
+        if not 200 <= resp.status_code < 300:
+            raise Exception(f"grok2api Web SSO 导入失败: HTTP {resp.status_code}")
+        result = _parse_grok2api_import_sse(resp.text)
+        created = int(result.get("created") or 0)
+        updated = int(result.get("updated") or 0)
+        skipped = int(result.get("skipped") or 0)
+        synced = int(result.get("synced") or 0)
+        sync_failed = int(result.get("syncFailed") or 0)
+        print(
+            f"[*] 已导入 grok2api Grok Web: created={created} updated={updated} "
+            f"skipped={skipped} synced={synced} syncFailed={sync_failed}"
+        )
+        if sync_failed:
+            raise Exception("SSO 已导入，但初始同步失败")
+        return True
+    raise Exception(last_error or "grok2api 管理员认证已失效")
+
+
 def push_sso_to_api(new_tokens: list):
-    # 推送 SSO token 到 grok2api 管理接口。
-    # append=false：直接将本次 token 列表全量推送（覆盖）。
-    # append=true（默认）：先 GET 查询线上现有 token，合并本次后全量推送。
+    # 优先走新版 grok2api（管理员登录 + /accounts/web/import）；
+    # 否则回退旧版 Python grok2api 的 ssoBasic 全量保存。
     import json
     import urllib3
     import requests
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    config_path = os.path.join(os.path.dirname(__file__), "config.json")
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            conf = json.load(f)
+        api_conf = _load_api_config()
     except Exception as e:
         print(f"[Warn] 读取 config.json 失败，跳过推送: {e}")
         return
 
-    api_conf = conf.get("api", {})
+    tokens_to_push = [_normalize_sso_token(item) for item in new_tokens]
+    tokens_to_push = [item for item in tokens_to_push if item]
+    if not tokens_to_push:
+        return
+
+    base = str(api_conf.get("base") or "").strip()
+    username = str(api_conf.get("admin_username") or "").strip()
+    password = str(api_conf.get("admin_password") or "")
+    if base and username and password:
+        try:
+            push_sso_to_grok2api_go(tokens_to_push, api_conf)
+        except Exception as exc:
+            print(f"[Warn] 推送 grok2api(Go) 失败: {exc}")
+        return
+
     endpoint = str(api_conf.get("endpoint", "")).strip()
     api_token = str(api_conf.get("token", "")).strip()
     append_mode = api_conf.get("append", True)
@@ -1492,7 +1650,16 @@ def main():
     parser.add_argument("--count", type=int, default=config_count, help=f"执行轮数，0 表示无限循环（默认读取 config.json run.count，当前 {config_count}）")
     parser.add_argument("--output", default=DEFAULT_SSO_FILE, help="sso 输出 txt 路径")
     parser.add_argument("--extract-numbers", action="store_true", help="注册完成后额外提取页面数字文本")
+    parser.add_argument("--push-sso", default="", help="只把已有 sso txt（一行一个）导入 grok2api，不跑注册")
     args = parser.parse_args()
+
+    if args.push_sso:
+        path = os.path.abspath(args.push_sso)
+        with open(path, "r", encoding="utf-8") as handle:
+            tokens = [line.strip() for line in handle if line.strip() and not line.strip().startswith("#")]
+        print(f"[*] 从文件导入 {len(tokens)} 个 SSO: {path}")
+        push_sso_to_api(tokens)
+        return
 
     current_round = 0
     collected_sso: list = []
@@ -1516,6 +1683,10 @@ def main():
                 result = run_single_registration(args.output, extract_numbers=args.extract_numbers)
                 collected_sso.append(result["sso"])
                 success_count += 1
+                try:
+                    push_sso_to_api([result["sso"]])
+                except Exception as push_exc:
+                    print(f"[Warn] 本轮推送 grok2api 失败: {push_exc}")
             except KeyboardInterrupt:
                 print("\n[Info] 收到中断信号，停止后续轮次。")
                 break
@@ -1536,8 +1707,18 @@ def main():
         print(f"\n[*] 本批结束：成功 {success_count}，失败 {fail_count}，共 {current_round} 轮")
 
     finally:
-        if collected_sso:
-            print(f"\n[*] 注册完成，推送 {len(collected_sso)} 个 token 到 API...")
+        # 新版 grok2api 已在每轮成功后增量导入；这里只给旧版 ssoBasic 做收尾全量推送。
+        try:
+            api_conf = _load_api_config()
+        except Exception:
+            api_conf = {}
+        go_mode = bool(
+            str(api_conf.get("base") or "").strip()
+            and str(api_conf.get("admin_username") or "").strip()
+            and api_conf.get("admin_password")
+        )
+        if collected_sso and not go_mode:
+            print(f"\n[*] 注册完成，推送 {len(collected_sso)} 个 token 到旧版 API...")
             push_sso_to_api(collected_sso)
 
         stop_browser()
