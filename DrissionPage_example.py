@@ -769,6 +769,8 @@ def getTurnstileToken():
     last_error = ""
     for i in range(20):
         try:
+            if page is None:
+                refresh_active_page()
             token = page.run_js(
                 """
 try {
@@ -786,11 +788,12 @@ try {
                 print(f"[*] Turnstile 已通过，token长度={len(token)}")
                 return token
 
-            challenge_input = page.ele("@name=cf-turnstile-response", timeout=2)
+            # 对齐参考实现：用默认超时找 iframe，不要额外 timeout 把页面拖死。
+            challenge_input = page.ele("@name=cf-turnstile-response")
             if challenge_input:
                 iframe = None
                 try:
-                    iframe = challenge_input.parent().shadow_root.ele("tag:iframe", timeout=2)
+                    iframe = challenge_input.parent().shadow_root.ele("tag:iframe")
                 except Exception:
                     iframe = None
                 if iframe:
@@ -808,12 +811,8 @@ Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sy });
                     except Exception:
                         pass
                     try:
-                        body_sr = iframe.ele("tag:body", timeout=2).shadow_root
-                        btn = None
-                        try:
-                            btn = body_sr.ele("css:input[type=checkbox]", timeout=2)
-                        except Exception:
-                            btn = body_sr.ele("tag:input", timeout=2)
+                        body_sr = iframe.ele("tag:body").shadow_root
+                        btn = body_sr.ele("tag:input")
                         if btn:
                             btn.click()
                     except Exception as error:
@@ -830,6 +829,10 @@ if (nodes.length && typeof nodes[0].click === 'function') nodes[0].click();
                 )
             if i == 0 or i % 5 == 4:
                 print(f"[*] 等待 Turnstile token（{i + 1}/20）")
+        except PageDisconnectedError as error:
+            last_error = str(error)
+            print("[Debug] Turnstile 检测时页面断开，刷新标签页后继续")
+            refresh_active_page()
         except Exception as error:
             last_error = str(error)
         time.sleep(1)
@@ -864,14 +867,22 @@ def build_profile():
 
 
 def fill_profile_and_submit(timeout=120):
-    # 在验证码通过后，直接锁定“可见且可写”的真实输入框，避免命中隐藏节点或 React 受控副本。
+    # 对齐 AaronL725：资料只填一次，避免反复写入把 Turnstile 冲掉；token 长度>=80 再提交。
     given_name, family_name, password = build_profile()
     deadline = time.time() + timeout
+    form_filled_once = False
     wait_cf_since = None
     last_cf_retry_at = 0.0
 
     while time.time() < deadline:
-        filled = page.run_js(
+        try:
+            refresh_active_page()
+            if page is None:
+                time.sleep(1)
+                continue
+
+            if not form_filled_once:
+                filled = page.run_js(
             """
 const givenName = arguments[0];
 const familyName = arguments[1];
@@ -961,17 +972,17 @@ return [
             password,
         )
 
-        if filled == 'not-ready':
-            time.sleep(0.5)
-            continue
+                if filled == 'not-ready':
+                    time.sleep(0.5)
+                    continue
 
-        if filled != 'filled':
-            print(f"[Debug] 最终注册页输入框已出现，但姓名/密码写入失败: {filled}")
-            time.sleep(0.5)
-            continue
+                if filled != 'filled':
+                    print(f"[Debug] 最终注册页输入框已出现，但姓名/密码写入失败: {filled}")
+                    time.sleep(0.5)
+                    continue
 
-        values_ok = page.run_js(
-            """
+                values_ok = page.run_js(
+                    """
 const expectedGiven = arguments[0];
 const expectedFamily = arguments[1];
 const expectedPassword = arguments[2];
@@ -1005,18 +1016,21 @@ if (!givenInput || !familyInput || !passwordInput) {
 return String(givenInput.value || '').trim() === String(expectedGiven || '').trim()
     && String(familyInput.value || '').trim() === String(expectedFamily || '').trim()
     && String(passwordInput.value || '') === String(expectedPassword || '');
-            """,
-            given_name,
-            family_name,
-            password,
-        )
-        if not values_ok:
-            print("[Debug] 最终注册页字段值校验失败，继续重试填写。")
-            time.sleep(0.5)
-            continue
+                    """,
+                    given_name,
+                    family_name,
+                    password,
+                )
+                if not values_ok:
+                    print("[Debug] 最终注册页字段值校验失败，继续重试填写。")
+                    time.sleep(0.5)
+                    continue
 
-        turnstile_state = page.run_js(
-            """
+                form_filled_once = True
+                print(f"[*] 资料已填写: {given_name} {family_name}")
+
+            turnstile_state = page.run_js(
+                """
 const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
 const cfPresent = !!challengeInput
   || !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey], script[src*="turnstile"]');
@@ -1025,23 +1039,22 @@ if (!cfPresent) {
 }
 const value = String((challengeInput && challengeInput.value) || '').trim();
 return value.length >= 80 ? 'ready' : ('pending:' + value.length);
-            """
-        )
+                """
+            )
 
-        if isinstance(turnstile_state, str) and turnstile_state.startswith("pending"):
-            token_len = turnstile_state.split(":", 1)[1] if ":" in turnstile_state else "0"
-            now = time.time()
-            if wait_cf_since is None:
-                wait_cf_since = now
-                print(f"[*] 资料已填写，等待 Cloudflare 自动通过... 当前token长度={token_len}")
-            # 参考 AaronL725：先等 12s 自动签发，再点击复用组件。
-            if now - wait_cf_since >= 12 and now - last_cf_retry_at >= 8:
-                print("[*] Cloudflare 验证卡住，开始二次复用 Turnstile...")
-                try:
-                    turnstile_token = getTurnstileToken()
-                    if turnstile_token:
-                        synced = page.run_js(
-                            """
+            if isinstance(turnstile_state, str) and turnstile_state.startswith("pending"):
+                token_len = turnstile_state.split(":", 1)[1] if ":" in turnstile_state else "0"
+                now = time.time()
+                if wait_cf_since is None:
+                    wait_cf_since = now
+                    print(f"[*] 资料已填写，等待 Cloudflare 自动通过... 当前token长度={token_len}")
+                if now - wait_cf_since >= 12 and now - last_cf_retry_at >= 8:
+                    print("[*] Cloudflare 验证卡住，开始二次复用 Turnstile...")
+                    try:
+                        turnstile_token = getTurnstileToken()
+                        if turnstile_token:
+                            synced = page.run_js(
+                                """
 const token = String(arguments[0] || '').trim();
 const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
 if (!challengeInput || !token) {
@@ -1056,26 +1069,26 @@ if (nativeSetter) {
 challengeInput.dispatchEvent(new Event('input', { bubbles: true }));
 challengeInput.dispatchEvent(new Event('change', { bubbles: true }));
 return String(challengeInput.value || '').trim().length;
-                            """,
-                            turnstile_token,
-                        )
-                        print(f"[*] Turnstile 二次复用完成，回填长度={synced}")
-                except Exception as cf_exc:
-                    print(f"[Debug] Turnstile 二次复用失败: {cf_exc}")
-                last_cf_retry_at = now
-            time.sleep(0.8)
-            continue
+                                """,
+                                turnstile_token,
+                            )
+                            print(f"[*] Turnstile 二次复用完成，回填长度={synced}")
+                    except Exception as cf_exc:
+                        print(f"[Debug] Turnstile 二次复用失败: {cf_exc}")
+                    last_cf_retry_at = now
+                time.sleep(0.8)
+                continue
 
-        time.sleep(1.2)
+            time.sleep(1.2)
 
-        try:
-            submit_button = page.ele('tag:button@@text()=完成注册') or page.ele('tag:button@@text():Create Account') or page.ele('tag:button@@text():Sign up')
-        except Exception:
-            submit_button = None
+            try:
+                submit_button = page.ele('tag:button@@text()=完成注册') or page.ele('tag:button@@text():Create Account') or page.ele('tag:button@@text():Sign up')
+            except Exception:
+                submit_button = None
 
-        if not submit_button:
-            clicked = page.run_js(
-                r"""
+            if not submit_button:
+                clicked = page.run_js(
+                    r"""
 const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
 if (challengeInput && String(challengeInput.value || '').trim().length < 80) {
     return false;
@@ -1091,30 +1104,34 @@ if (!submitButton || submitButton.disabled || submitButton.getAttribute('aria-di
 submitButton.focus();
 submitButton.click();
 return true;
-                """
-            )
-        else:
-            challenge_value = page.run_js(
-                """
+                    """
+                )
+            else:
+                challenge_value = page.run_js(
+                    """
 const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
 return challengeInput ? String(challengeInput.value || '').trim() : 'not-found';
-                """
-            )
-            if len(str(challenge_value or "")) >= 80 or challenge_value == 'not-found':
-                submit_button.click()
-                clicked = True
-            else:
-                clicked = False
+                    """
+                )
+                if len(str(challenge_value or "")) >= 80 or challenge_value == 'not-found':
+                    submit_button.click()
+                    clicked = True
+                else:
+                    clicked = False
 
-        if clicked:
-            print(f"[*] 已填写注册资料并点击完成注册: {given_name} {family_name} / {password}")
-            return {
-                "given_name": given_name,
-                "family_name": family_name,
-                "password": password,
-            }
+            if clicked:
+                print(f"[*] 已填写注册资料并点击完成注册: {given_name} {family_name} / {password}")
+                return {
+                    "given_name": given_name,
+                    "family_name": family_name,
+                    "password": password,
+                }
 
-        time.sleep(0.5)
+            time.sleep(0.5)
+        except PageDisconnectedError:
+            print("[Debug] 资料页断开，刷新标签页后继续")
+            refresh_active_page()
+            time.sleep(1)
 
     raise Exception("未找到最终注册表单或完成注册按钮")
 
