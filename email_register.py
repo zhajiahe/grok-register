@@ -131,16 +131,16 @@ def _generate_password(length=14):
     return "".join(pwd)
 
 
-def list_email_domains(exclude_domains: Optional[List[str]] = None) -> List[str]:
-    """从 DuckMail /domains 拉取已验证域名，默认排除 duckmail.sbs。"""
+def _fetch_domain_records(exclude_domains: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """从 DuckMail /domains 拉取已验证域名记录（含 ownerId），默认排除 duckmail.sbs。"""
     excluded = {d.lower() for d in DUCKMAIL_EXCLUDE_DOMAINS}
     if exclude_domains:
         excluded.update(str(d).strip().lstrip("@").lower() for d in exclude_domains if d)
 
     if DUCKMAIL_DOMAINS:
-        domains = [d for d in DUCKMAIL_DOMAINS if d not in excluded]
-        if domains:
-            return domains
+        records = [{"domain": d, "ownerId": True, "isVerified": True} for d in DUCKMAIL_DOMAINS if d not in excluded]
+        if records:
+            return records
 
     if not DUCKMAIL_BEARER:
         raise Exception("duckmail_bearer 未设置，无法获取邮箱域名")
@@ -148,7 +148,8 @@ def list_email_domains(exclude_domains: Optional[List[str]] = None) -> List[str]
     api_base = DUCKMAIL_API_BASE.rstrip("/")
     bearer_headers = {"Authorization": f"Bearer {DUCKMAIL_BEARER}"}
     session, use_cffi = _create_duckmail_session()
-    found: List[str] = []
+    found: List[Dict[str, Any]] = []
+    seen: set[str] = set()
     page = 1
     while page <= 10:
         res = _do_request(
@@ -166,11 +167,16 @@ def list_email_domains(exclude_domains: Optional[List[str]] = None) -> List[str]
             if not isinstance(item, dict):
                 continue
             domain = str(item.get("domain") or "").strip().lstrip("@").lower()
-            if not domain or domain in excluded or domain in found:
+            if not domain or domain in excluded or domain in seen:
                 continue
             if item.get("isVerified") is False:
                 continue
-            found.append(domain)
+            seen.add(domain)
+            found.append({
+                "domain": domain,
+                "ownerId": item.get("ownerId"),
+                "isVerified": item.get("isVerified") is not False,
+            })
         total = data.get("hydra:totalItems")
         if not members:
             break
@@ -183,9 +189,22 @@ def list_email_domains(exclude_domains: Optional[List[str]] = None) -> List[str]
     return found
 
 
+def list_email_domains(exclude_domains: Optional[List[str]] = None) -> List[str]:
+    """从 DuckMail /domains 拉取已验证域名，默认排除 duckmail.sbs。"""
+    return [str(item["domain"]) for item in _fetch_domain_records(exclude_domains=exclude_domains)]
+
+
 def pick_email_domain(exclude_domains: Optional[List[str]] = None) -> str:
-    domains = list_email_domains(exclude_domains=exclude_domains)
-    return random.choice(domains)
+    # 对齐 AaronL725：优先用带 ownerId 的已验证私有域名，再回落到其它已验证域名。
+    records = _fetch_domain_records(exclude_domains=exclude_domains)
+    private = [item for item in records if item.get("ownerId")]
+    pool = private or records
+    domain = str(random.choice(pool)["domain"])
+    if private:
+        print(f"[*] DuckMail 选用私有域名: {domain}（ownerId 优先，候选 {len(private)} 个）")
+    else:
+        print(f"[*] DuckMail 选用已验证域名: {domain}（候选 {len(pool)} 个）")
+    return domain
 
 
 def create_temp_email(exclude_domains: Optional[List[str]] = None) -> Tuple[str, str, str]:

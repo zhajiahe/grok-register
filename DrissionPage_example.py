@@ -1,8 +1,8 @@
 from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
 import argparse
-import shutil
-import tempfile
+import glob as _glob_mod
+import platform
 import datetime
 import logging
 import time
@@ -84,16 +84,10 @@ if os.environ.get("DISABLE_XVFB") != "1" and (not os.environ.get("DISPLAY") or _
     except Exception as e:
         print(f"[Warn] Xvfb 启动失败: {e}，将尝试直接运行")
 
-co = ChromiumOptions()
-co.auto_port()
-co.set_argument("--no-sandbox")
-co.set_argument("--disable-gpu")
-co.set_argument("--disable-dev-shm-usage")
-co.set_argument("--disable-software-rasterizer")
-co.set_argument("--disable-blink-features=AutomationControlled")
-co.set_argument("--window-size=1920,1080")
+# 对齐 AaronL725/grok-register：每轮新建 ChromiumOptions，让 auto_port 自己分配端口和 profile。
+# DrissionPage 4.1.1+ 里 set_user_data_path() 会把 auto_port 关掉并清空 address，导致启动崩溃。
+EXTENSION_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "turnstilePatch"))
 
-# 从 config.json 读取代理配置给浏览器
 _browser_proxy = ""
 try:
     import json as _json_mod
@@ -105,32 +99,53 @@ try:
 except Exception:
     pass
 if _browser_proxy:
-    co.set_proxy(_browser_proxy)
     print(f"[*] 浏览器代理: {_browser_proxy}")
 
-# Linux 服务器自动检测 chromium 路径
-import platform
-import shutil
-import glob as _glob_mod
-if platform.system() == "Linux":
-    # 优先用 playwright 装的 chromium（无 AppArmor 限制）
-    _pw_chromes = _glob_mod.glob(os.path.expanduser("~/.cache/ms-playwright/chromium-*/chrome-linux*/chrome"))
-    if _pw_chromes:
-        co.set_browser_path(_pw_chromes[0])
-    else:
-        for _candidate in ["/usr/bin/chromium-browser", "/usr/bin/chromium", "/usr/bin/google-chrome"]:
-            if os.path.isfile(_candidate):
-                co.set_browser_path(_candidate)
-                break
-    # user_data_path 在 start_browser() 每轮动态设置，此处不固定
 
-co.set_timeouts(base=1)
+def _detect_chrome_path() -> str:
+    candidates = [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/chromium",
+    ]
+    if platform.system() == "Linux":
+        candidates.extend(
+            _glob_mod.glob(os.path.expanduser("~/.cache/ms-playwright/chromium-*/chrome-linux*/chrome"))
+        )
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return ""
 
-# 加载修复 MouseEvent.screenX / screenY 的扩展。
-EXTENSION_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "turnstilePatch"))
-co.add_extension(EXTENSION_PATH)
 
-_chrome_temp_dir: str = ""
+_chrome_path = _detect_chrome_path()
+if _chrome_path:
+    print(f"[*] 浏览器路径: {_chrome_path}")
+
+
+def create_browser_options():
+    # 参考 AaronL725/browser_runtime.create_browser_options：参数尽量少，贴近普通 Chrome。
+    options = ChromiumOptions()
+    options.auto_port()
+    options.set_timeouts(base=1)
+    try:
+        options.headless(False)
+    except Exception:
+        pass
+    # 容器里仍需要这两项才能拉起 Chrome；不要再加 disable-gpu / AutomationControlled。
+    if platform.system() == "Linux":
+        options.set_argument("--no-sandbox")
+        options.set_argument("--disable-dev-shm-usage")
+    if _chrome_path:
+        options.set_browser_path(_chrome_path)
+    if _browser_proxy:
+        options.set_proxy(_browser_proxy)
+    if os.path.isdir(EXTENSION_PATH):
+        options.add_extension(EXTENSION_PATH)
+    return options
+
+
 browser = None
 page = None
 
@@ -142,45 +157,50 @@ DEFAULT_SSO_FILE = os.path.join(_sso_dir, f"sso_{_sso_ts}.txt")
 
 
 def start_browser():
-    # 每轮从全新浏览器开始，使用独立临时 profile 目录避免 Cookie/Session 复用。
-    global browser, page, _chrome_temp_dir
-    _chrome_temp_dir = tempfile.mkdtemp(prefix="chrome_run_")
-    co.set_user_data_path(_chrome_temp_dir)
-    browser = Chromium(co)
-    tabs = browser.get_tabs()
-    page = tabs[-1] if tabs else browser.new_tab()
-    return browser, page
+    # 对齐参考实现：每次启动都新建 ChromiumOptions，失败最多重试 4 次。
+    global browser, page
+    last_exc = None
+    for attempt in range(1, 5):
+        try:
+            browser = Chromium(create_browser_options())
+            tabs = browser.get_tabs()
+            page = tabs[-1] if tabs else browser.new_tab()
+            if attempt > 1:
+                print(f"[*] 浏览器第 {attempt} 次启动成功")
+            return browser, page
+        except Exception as exc:
+            last_exc = exc
+            print(f"[Debug] 浏览器启动失败(第{attempt}/4次): {exc}")
+            try:
+                if browser is not None:
+                    browser.quit(del_data=True)
+            except Exception:
+                pass
+            browser = None
+            page = None
+            time.sleep(min(1.5 * attempt, 4))
+    raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
 
 
 def stop_browser():
-    # 完整关闭整个浏览器实例，并清理本轮临时 profile，供下一轮重新拉起。
-    global browser, page, _chrome_temp_dir
+    # 完整关闭浏览器，del_data=True 让 DrissionPage 清掉 auto_port 分配的临时 profile。
+    global browser, page
     if browser is not None:
         try:
-            browser.quit()
+            try:
+                browser.quit(del_data=True)
+            except TypeError:
+                browser.quit()
         except Exception:
             pass
     browser = None
     page = None
-    if _chrome_temp_dir and os.path.isdir(_chrome_temp_dir):
-        shutil.rmtree(_chrome_temp_dir, ignore_errors=True)
-    _chrome_temp_dir = ""
 
 
 def restart_browser():
-    # 清除 cookie/storage 代替完整重启，节省 Chrome 冷启动时间。
-    global browser, page
-    if browser is None:
-        start_browser()
-        return
-    try:
-        tabs = browser.get_tabs()
-        page = tabs[-1] if tabs else browser.new_tab()
-        page.run_js("window.localStorage.clear(); window.sessionStorage.clear();")
-        page.clear_cache(session_storage=True, cookies=True)
-    except Exception:
-        stop_browser()
-        start_browser()
+    # 对齐参考实现：每轮完整停掉再拉起，避免 SSO / Turnstile 状态串轮。
+    stop_browser()
+    start_browser()
 
 
 def refresh_active_page():
@@ -464,9 +484,9 @@ return true;
 
 
 
-def fill_code_and_submit(email, dev_token, timeout=60):
+def fill_code_and_submit(email, dev_token, timeout=180):
     # 复用 `email_register.py` 里的验证码轮询逻辑，等待邮件到达后自动填写 OTP。
-    code = get_oai_code(dev_token, email, timeout=90)
+    code = get_oai_code(dev_token, email, timeout=180)
     if not code:
         raise Exception("获取验证码失败")
 
@@ -735,90 +755,120 @@ return { url: location.href, inputs, buttons };
 
 
 def getTurnstileToken():
-    # 先等 Turnstile 自动出 token；不行再点 checkbox。Cloud Agent 下配合 Xvfb 降低交互验证概率。
-    def _read_token():
-        try:
-            token = page.run_js("try { return turnstile.getResponse() } catch(e) { return null }")
-            if token:
-                return token
-        except Exception:
-            pass
-        try:
-            value = page.run_js(
-                """
-const input = document.querySelector('input[name="cf-turnstile-response"]');
-return input ? String(input.value || '').trim() : '';
-                """
-            )
-            return value or None
-        except Exception:
-            return None
+    # 对齐 AaronL725/grok-register：token 长度 >= 80 才算通过；先等自动签发，卡住再点 checkbox。
+    if page is None:
+        raise Exception("页面未就绪，无法执行 Turnstile")
 
-    for _ in range(8):
-        token = _read_token()
-        if token:
-            print("[*] Turnstile 已自动通过。")
-            return token
-        time.sleep(0.5)
+    try:
+        page.run_js(
+            "try { if (window.turnstile && typeof turnstile.reset === 'function') turnstile.reset(); } catch(e) {}"
+        )
+    except Exception:
+        pass
 
     last_error = ""
     for i in range(20):
-        token = _read_token()
-        if token:
-            print("[*] Turnstile 点击后已拿到响应。")
-            return token
         try:
-            challengeSolution = page.ele("@name=cf-turnstile-response", timeout=3)
-            challengeWrapper = challengeSolution.parent()
-            challengeIframe = challengeWrapper.shadow_root.ele("tag:iframe", timeout=3)
-            challengeIframe.run_js("""
-window.dtp = 1
-function getRandomInt(min, max) {
-    return Math.floor(Math.random() * (max - min + 1)) + min;
-}
-let screenX = getRandomInt(800, 1200);
-let screenY = getRandomInt(400, 600);
-Object.defineProperty(MouseEvent.prototype, 'screenX', { value: screenX });
-Object.defineProperty(MouseEvent.prototype, 'screenY', { value: screenY });
-            """)
-            challengeIframeBody = challengeIframe.ele("tag:body", timeout=3).shadow_root
-            challengeButton = None
-            try:
-                challengeButton = challengeIframeBody.ele("css:input[type=checkbox]", timeout=3)
-            except Exception:
+            token = page.run_js(
+                """
+try {
+  const byInput = String((document.querySelector('input[name="cf-turnstile-response"]') || {}).value || '').trim();
+  if (byInput) return byInput;
+  if (window.turnstile && typeof turnstile.getResponse === 'function') {
+    return String(turnstile.getResponse() || '').trim();
+  }
+  return '';
+} catch(e) { return ''; }
+                """
+            )
+            token = str(token or "").strip()
+            if len(token) >= 80:
+                print(f"[*] Turnstile 已通过，token长度={len(token)}")
+                return token
+
+            challenge_input = page.ele("@name=cf-turnstile-response", timeout=2)
+            if challenge_input:
+                iframe = None
                 try:
-                    challengeButton = challengeIframeBody.ele("tag:input", timeout=3)
+                    iframe = challenge_input.parent().shadow_root.ele("tag:iframe", timeout=2)
                 except Exception:
-                    challengeButton = None
-            if challengeButton:
-                challengeButton.click()
-            try:
-                label = challengeIframeBody.ele("tag:label", timeout=1)
-                label.click()
-            except Exception:
-                pass
+                    iframe = None
+                if iframe:
+                    try:
+                        iframe.run_js(
+                            """
+window.dtp = 1;
+function getRandomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+let sx = getRandomInt(800, 1200);
+let sy = getRandomInt(400, 700);
+Object.defineProperty(MouseEvent.prototype, 'screenX', { value: sx });
+Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sy });
+                            """
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        body_sr = iframe.ele("tag:body", timeout=2).shadow_root
+                        btn = None
+                        try:
+                            btn = body_sr.ele("css:input[type=checkbox]", timeout=2)
+                        except Exception:
+                            btn = body_sr.ele("tag:input", timeout=2)
+                        if btn:
+                            btn.click()
+                    except Exception as error:
+                        last_error = str(error)
+            else:
+                page.run_js(
+                    """
+const nodes = Array.from(document.querySelectorAll('div,span,iframe')).filter((n) => {
+  const txt = (n.className || '') + ' ' + (n.id || '') + ' ' + (n.getAttribute?.('src') || '');
+  return String(txt).toLowerCase().includes('turnstile');
+});
+if (nodes.length && typeof nodes[0].click === 'function') nodes[0].click();
+                    """
+                )
             if i == 0 or i % 5 == 4:
-                print(f"[*] 正在点击 Turnstile checkbox ({i + 1}/20)")
+                print(f"[*] 等待 Turnstile token（{i + 1}/20）")
         except Exception as error:
             last_error = str(error)
         time.sleep(1)
 
-    raise Exception(f"failed to solve turnstile{': ' + last_error if last_error else ''}")
+    raise Exception(f"Turnstile 获取 token 失败{': ' + last_error if last_error else ''}")
 
 
 def build_profile():
-    # 生成一组可重复使用的注册资料，密码至少包含大小写、数字和特殊字符。
-    given_name = "Neo"
-    family_name = "Lin"
+    # 对齐参考实现：随机姓名，避免固定 Neo Lin 被风控。
+    given_name_pool = [
+        "Neo", "Ethan", "Liam", "Noah", "Lucas", "Mason", "Ryan", "Leo",
+        "Owen", "Aiden", "Elio", "Aron", "Ivan", "Nolan", "Evan", "Kai",
+        "Caleb", "Adam", "Ezra", "Miles", "Logan", "Carter", "Hunter", "Jason",
+        "Brian", "Dylan", "Alex", "Colin", "Blake", "Gavin", "Henry", "Julian",
+        "Kevin", "Louis", "Marcus", "Nathan", "Oscar", "Peter", "Quinn", "Robin",
+        "Simon", "Tristan", "Victor", "Wesley", "Xavier", "Yuri", "Zane", "Felix",
+        "Aaron", "Damian",
+    ]
+    family_name_pool = [
+        "Lin", "Wang", "Zhao", "Liu", "Chen", "Zhang", "Xu", "Sun",
+        "Guo", "He", "Yang", "Wu", "Zhou", "Tang", "Qin", "Shi",
+        "Fang", "Peng", "Cao", "Deng", "Fan", "Fu", "Gao", "Han",
+        "Hu", "Jiang", "Kong", "Lu", "Ma", "Nie", "Pan", "Qiao",
+        "Ren", "Shao", "Tian", "Xie", "Yan", "Yao", "Yu", "Zeng",
+        "Bai", "Duan", "Hou", "Jin", "Kang", "Luo", "Mao", "Song",
+        "Wei", "Xiong",
+    ]
+    given_name = secrets.choice(given_name_pool)
+    family_name = secrets.choice(family_name_pool)
     password = "N" + secrets.token_hex(4) + "!a7#" + secrets.token_urlsafe(6)
     return given_name, family_name, password
 
 
-def fill_profile_and_submit(timeout=30):
+def fill_profile_and_submit(timeout=120):
     # 在验证码通过后，直接锁定“可见且可写”的真实输入框，避免命中隐藏节点或 React 受控副本。
     given_name, family_name, password = build_profile()
     deadline = time.time() + timeout
-    turnstile_token = ""
+    wait_cf_since = None
+    last_cf_retry_at = 0.0
 
     while time.time() < deadline:
         filled = page.run_js(
@@ -968,24 +1018,34 @@ return String(givenInput.value || '').trim() === String(expectedGiven || '').tri
         turnstile_state = page.run_js(
             """
 const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (!challengeInput) {
+const cfPresent = !!challengeInput
+  || !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey], script[src*="turnstile"]');
+if (!cfPresent) {
     return 'not-found';
 }
-const value = String(challengeInput.value || '').trim();
-return value ? 'ready' : 'pending';
+const value = String((challengeInput && challengeInput.value) || '').trim();
+return value.length >= 80 ? 'ready' : ('pending:' + value.length);
             """
         )
 
-        if turnstile_state == "pending" and not turnstile_token:
-            print("[*] 检测到最终注册页存在 Turnstile，开始使用现有真人化点击逻辑。")
-            turnstile_token = getTurnstileToken()
-            if turnstile_token:
-                synced = page.run_js(
-                    """
-const token = arguments[0];
+        if isinstance(turnstile_state, str) and turnstile_state.startswith("pending"):
+            token_len = turnstile_state.split(":", 1)[1] if ":" in turnstile_state else "0"
+            now = time.time()
+            if wait_cf_since is None:
+                wait_cf_since = now
+                print(f"[*] 资料已填写，等待 Cloudflare 自动通过... 当前token长度={token_len}")
+            # 参考 AaronL725：先等 12s 自动签发，再点击复用组件。
+            if now - wait_cf_since >= 12 and now - last_cf_retry_at >= 8:
+                print("[*] Cloudflare 验证卡住，开始二次复用 Turnstile...")
+                try:
+                    turnstile_token = getTurnstileToken()
+                    if turnstile_token:
+                        synced = page.run_js(
+                            """
+const token = String(arguments[0] || '').trim();
 const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (!challengeInput) {
-    return false;
+if (!challengeInput || !token) {
+    return 0;
 }
 const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
 if (nativeSetter) {
@@ -995,12 +1055,16 @@ if (nativeSetter) {
 }
 challengeInput.dispatchEvent(new Event('input', { bubbles: true }));
 challengeInput.dispatchEvent(new Event('change', { bubbles: true }));
-return String(challengeInput.value || '').trim() === String(token || '').trim();
-                    """,
-                    turnstile_token,
-                )
-                if synced:
-                    print("[*] Turnstile 响应已同步到最终注册表单。")
+return String(challengeInput.value || '').trim().length;
+                            """,
+                            turnstile_token,
+                        )
+                        print(f"[*] Turnstile 二次复用完成，回填长度={synced}")
+                except Exception as cf_exc:
+                    print(f"[Debug] Turnstile 二次复用失败: {cf_exc}")
+                last_cf_retry_at = now
+            time.sleep(0.8)
+            continue
 
         time.sleep(1.2)
 
@@ -1013,7 +1077,7 @@ return String(challengeInput.value || '').trim() === String(token || '').trim();
             clicked = page.run_js(
                 r"""
 const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (challengeInput && !String(challengeInput.value || '').trim()) {
+if (challengeInput && String(challengeInput.value || '').trim().length < 80) {
     return false;
 }
 const buttons = Array.from(document.querySelectorAll('button[type="submit"], button'));
@@ -1036,7 +1100,7 @@ const challengeInput = document.querySelector('input[name="cf-turnstile-response
 return challengeInput ? String(challengeInput.value || '').trim() : 'not-found';
                 """
             )
-            if challenge_value not in ('not-found', ''):
+            if len(str(challenge_value or "")) >= 80 or challenge_value == 'not-found':
                 submit_button.click()
                 clicked = True
             else:
