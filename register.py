@@ -1591,7 +1591,7 @@ def _grok2api_admin_login(api_base: str, username: str, password: str, force: bo
     return token
 
 
-def _parse_grok2api_import_sse(text: str) -> dict:
+def _parse_grok2api_sse(text: str, action: str) -> dict:
     import json
     event = ""
     completed = None
@@ -1612,10 +1612,173 @@ def _parse_grok2api_import_sse(text: str) -> dict:
         if event == "complete" and isinstance(data, dict):
             completed = data
     if error_message:
-        raise Exception("grok2api 导入失败: " + error_message[:200])
+        raise Exception(f"grok2api {action}失败: " + error_message[:200])
     if completed is None:
-        raise Exception("grok2api 导入响应缺少 complete 事件")
+        raise Exception(f"grok2api {action}响应缺少 complete 事件")
     return completed
+
+
+def _read_grok2api_sse(resp, action: str) -> dict:
+    chunks = []
+    for line in resp.iter_lines(decode_unicode=True):
+        if line:
+            chunks.append(line)
+    return _parse_grok2api_sse("\n".join(chunks), action)
+
+
+def _convert_to_build_enabled(api_conf: dict) -> bool:
+    if os.environ.get("GROK_REGISTER_CONVERT_TO_BUILD") == "0":
+        return False
+    if "convert_to_build" not in api_conf:
+        return True
+    return bool(api_conf.get("convert_to_build"))
+
+
+def _parse_iso_datetime(value: str):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.datetime.fromisoformat(text)
+    except Exception:
+        pass
+    if "." in text:
+        head, rest = text.split(".", 1)
+        frac = ""
+        tz = ""
+        for index, char in enumerate(rest):
+            if char.isdigit():
+                frac += char
+            else:
+                tz = rest[index:]
+                break
+        text = head + "." + (frac[:6].ljust(6, "0")) + tz
+        try:
+            return datetime.datetime.fromisoformat(text)
+        except Exception:
+            return None
+    return None
+
+
+def _list_unlinked_web_ids(api_base: str, access: str, *, recent_seconds: int = 0, limit: int = 1000) -> list:
+    import requests
+
+    ids = []
+    page = 1
+    page_size = 100
+    cutoff = None
+    if recent_seconds > 0:
+        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=recent_seconds)
+    while len(ids) < limit:
+        resp = requests.get(
+            api_base + "/accounts",
+            headers={"Authorization": f"Bearer {access}", "Accept": "application/json"},
+            params={
+                "page": page,
+                "pageSize": page_size,
+                "provider": "grok_web",
+                "association": "buildUnlinked",
+                "sortBy": "createdAt",
+                "sortOrder": "desc",
+            },
+            timeout=30,
+        )
+        if not 200 <= resp.status_code < 300:
+            raise Exception(f"grok2api 读取未关联 Web 账号失败: HTTP {resp.status_code}")
+        payload = resp.json().get("data") or {}
+        items = payload.get("items") or []
+        if not items:
+            break
+        stop = False
+        for item in items:
+            created_at = _parse_iso_datetime(str(item.get("createdAt") or ""))
+            if created_at is not None and created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=datetime.timezone.utc)
+            if cutoff is not None and created_at is not None and created_at < cutoff:
+                stop = True
+                break
+            account_id = str(item.get("id") or "").strip()
+            if account_id:
+                ids.append(account_id)
+            if len(ids) >= limit:
+                break
+        if stop or len(items) < page_size:
+            break
+        page += 1
+    return ids
+
+
+def _convert_web_to_build(api_base: str, access: str, *, ids=None, convert_all: bool = False) -> dict:
+    import requests
+
+    body = {"strategy": "missing"}
+    if convert_all:
+        body["all"] = True
+        timeout = 6 * 60 * 60
+    else:
+        ids = [str(item).strip() for item in (ids or []) if str(item).strip()]
+        if not ids:
+            return {"created": 0, "linked": 0, "skipped": 0, "failed": 0, "synced": 0, "syncFailed": 0}
+        body["ids"] = ids
+        timeout = min(max(180, 90 * len(ids)), 30 * 60)
+    last_error = ""
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                api_base + "/accounts/web/convert-to-build",
+                headers={
+                    "Authorization": f"Bearer {access}",
+                    "Accept": "text/event-stream",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=timeout,
+                stream=True,
+            )
+            if not 200 <= resp.status_code < 300:
+                raise Exception(f"grok2api Web 转 Build 失败: HTTP {resp.status_code}")
+            return _read_grok2api_sse(resp, "Web 转 Build")
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt >= 2:
+                break
+            time.sleep(2 * (attempt + 1))
+    raise Exception(last_error or "grok2api Web 转 Build 失败")
+
+
+def _convert_imported_web_to_build(api_base: str, access: str, imported: int) -> None:
+    recent_ids = _list_unlinked_web_ids(api_base, access, recent_seconds=30 * 60, limit=1000)
+    if recent_ids:
+        result = _convert_web_to_build(api_base, access, ids=recent_ids)
+    elif imported >= 20:
+        result = _convert_web_to_build(api_base, access, convert_all=True)
+    elif imported > 0:
+        result = _convert_web_to_build(
+            api_base,
+            access,
+            ids=_list_unlinked_web_ids(api_base, access, limit=min(imported, 1000)),
+        )
+    else:
+        return
+    print(
+        "[*] 已转换 grok2api Grok Build: created={created} linked={linked} "
+        "skipped={skipped} failed={failed} synced={synced} syncFailed={syncFailed}".format(
+            created=int(result.get("created") or 0),
+            linked=int(result.get("linked") or 0),
+            skipped=int(result.get("skipped") or 0),
+            failed=int(result.get("failed") or 0),
+            synced=int(result.get("synced") or 0),
+            syncFailed=int(result.get("syncFailed") or 0),
+        )
+    )
+    if int(result.get("failed") or 0) or int(result.get("syncFailed") or 0):
+        created = int(result.get("created") or 0)
+        linked = int(result.get("linked") or 0)
+        if created + linked <= 0:
+            raise Exception("Web 已导入，但转 Build 未全部成功")
+        print("[Warn] 部分 Web 转 Build 未成功，下一轮会重试未关联号")
 
 
 def push_sso_to_grok2api_go(new_tokens: list, api_conf: dict) -> bool:
@@ -1642,7 +1805,7 @@ def push_sso_to_grok2api_go(new_tokens: list, api_conf: dict) -> bool:
             continue
         if not 200 <= resp.status_code < 300:
             raise Exception(f"grok2api Web SSO 导入失败: HTTP {resp.status_code}")
-        result = _parse_grok2api_import_sse(resp.text)
+        result = _parse_grok2api_sse(resp.text, "导入")
         created = int(result.get("created") or 0)
         updated = int(result.get("updated") or 0)
         skipped = int(result.get("skipped") or 0)
@@ -1654,12 +1817,14 @@ def push_sso_to_grok2api_go(new_tokens: list, api_conf: dict) -> bool:
         )
         if sync_failed:
             raise Exception("SSO 已导入，但初始同步失败")
+        if _convert_to_build_enabled(api_conf):
+            _convert_imported_web_to_build(api_base, access, created + updated)
         return True
     raise Exception(last_error or "grok2api 管理员认证已失效")
 
 
 def push_sso_to_api(new_tokens: list):
-    # 优先走新版 grok2api（管理员登录 + /accounts/web/import）；
+    # 优先走新版 grok2api（管理员登录 + /accounts/web/import，默认再转 Build）；
     # 否则回退旧版 Python grok2api 的 ssoBasic 全量保存。
     import json
     import urllib3
@@ -1870,7 +2035,11 @@ def run_batch_rounds(count, output_path, extract_numbers=False, worker_id=None):
                 fail_count += 1
                 print(f"[Error] {prefix}第 {current_round} 轮失败: {error}")
                 err_text = str(error)
-                if any(marker in err_text for marker in ("Turnstile", "未找到最终注册表单", "人机", "Cloudflare", "超时")):
+                email_only = any(
+                    marker in err_text
+                    for marker in ("DuckMail", "验证码", "邮箱被拒", "邮箱域名", "邮件")
+                )
+                if not email_only:
                     mark_proxy_dead(err_text.split("\n", 1)[0][:120])
                 if run_logger:
                     run_logger.error(
@@ -2018,12 +2187,19 @@ def main():
     parser.add_argument("--extract-numbers", action="store_true", help="注册完成后额外提取页面数字文本")
     parser.add_argument("--push-sso", default="", help="只把已有 sso txt（一行一个）导入 grok2api，不跑注册")
     parser.add_argument(
+        "--no-convert-to-build",
+        action="store_true",
+        help="导入 grok2api 后不要转成 Grok Build（默认会转）",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=load_run_workers(),
         help="并行浏览器进程数（默认读取 config.json run.workers，本机建议 2–3）",
     )
     args = parser.parse_args()
+    if args.no_convert_to_build:
+        os.environ["GROK_REGISTER_CONVERT_TO_BUILD"] = "0"
 
     if args.push_sso:
         path = os.path.abspath(args.push_sso)
