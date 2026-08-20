@@ -16,6 +16,7 @@
         "append": true,
         "base": "",
         "admin_username": "",
-        "admin_password": ""
+        "admin_password": "",
+        "convert_to_build": true
     }
 }

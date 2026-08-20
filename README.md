@@ -46,7 +46,8 @@ pip install -r requirements.txt
 | `duckmail_exclude_domains` | 默认排除 `duckmail.sbs`（x.ai 会拒） |
 | `proxy` | 仅 DuckMail API 走代理 |
 | `browser_proxy` / `browser_proxies` | 浏览器出口；池内预检，失败两次才跳过，按成功次数打分 |
-| `api.base` + 管理员账号 | 新版 grok2api，成功后走 `/accounts/web/import` |
+| `api.base` + 管理员账号 | 新版 grok2api，成功后导入 Web，并默认转成 Build |
+| `api.convert_to_build` | 默认 `true`；`false` 或 `--no-convert-to-build` 则只留 Web |
 | `api.endpoint` / `api.token` | 旧版 Python grok2api 的 `ssoBasic`；配了 `api.base` 时忽略 |
 
 代理写成 `http://host:port`。优先 HTTP，SOCKS 启动 Chrome 不稳定。`proxy` 和 `browser_proxies` 不要混用。非本机 `api.base` 必须 HTTPS。
@@ -74,9 +75,7 @@ DISABLE_XVFB=1 python3 register.py
 
 ## grok2api
 
-导入的是 **Grok Web SSO**，不是 Build，也不是官方 API Key。
-
-新版（Go）填 `api.base` + 管理员账号，每轮成功调用 `/api/admin/v1/accounts/web/import`。只导入已有文件用 `--push-sso`。旧版用 `api.endpoint` + `api.token`。两种都配时走新版。
+导入的是 **Grok Web SSO**，不是官方 API Key。新版（Go）填 `api.base` + 管理员账号：每轮成功先 `/accounts/web/import`，再默认 `/accounts/web/convert-to-build`（`strategy=missing`），这样才能调 `grok-4.6`。只导入已有文件用 `--push-sso`。旧版用 `api.endpoint` + `api.token`。两种都配时走新版。不想转 Build 时设 `api.convert_to_build: false` 或加 `--no-convert-to-build`。
 
 | 调用名 | 实际来源 |
 | --- | --- |
@@ -84,7 +83,7 @@ DISABLE_XVFB=1 python3 register.py
 | `grok-chat-auto` / `expert` / `heavy` | 网页对应档，分别要 Super / Heavy |
 | `grok-4.6` | Grok Build 或 Console，需 Build OAuth |
 
-要 `grok-4.6`：把 Web 转成 Build（`POST /api/admin/v1/accounts/web/convert-to-build`，`{"all": true, "strategy": "missing"}`），客户端密钥 `providerScope` 含 `grok_build`，并给 Build 配出口。推理档：`grok-4.6-low` / `-medium` / `-high` / `-xhigh`。
+要 `grok-4.6`：账号需在 Grok Build 池里（默认导入后会转），客户端密钥 `providerScope` 含 `grok_build`，并给 Build 配出口。存量 Web 可再调 `POST /api/admin/v1/accounts/web/convert-to-build`，`{"all": true, "strategy": "missing"}`。推理档：`grok-4.6-low` / `-medium` / `-high` / `-xhigh`。
 
 ## 产出
 
@@ -96,7 +95,7 @@ DISABLE_XVFB=1 python3 register.py
 - **邮箱域名被拒**：已跳过 `duckmail.sbs`，被拒会换域。也可在 `duckmail_domains` 里写已验证域名。
 - **Turnstile token 一直为 0**：出口分太低。换住宅代理，或在有桌面的机器上跑。
 - **Chrome 起不来**：用系统 Chrome，不要给 DrissionPage 设 `user-data-path`。
-- **chat 没有 grok-4.6**：SSO 先入 Web，再转 Build，密钥包含 `grok_build`。
+- **chat 没有 grok-4.6**：确认已转成 Build，密钥包含 `grok_build`。用 `--no-convert-to-build` 时不会出现 4.6。
 
 ## 致谢
 
