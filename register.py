@@ -100,6 +100,7 @@ EXTENSION_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "turnst
 
 _browser_proxy = ""
 _proxy_pool: list = []
+_proxy_fallback_pool: list = []
 _proxy_index = 0
 _proxy_dead: set = set()
 _proxy_stats: dict = {}
@@ -198,16 +199,25 @@ def _proxy_skipped(proxy: str) -> bool:
     return _proxy_stat(proxy)["fail_streak"] >= _PROXY_FAIL_STRIKES
 
 
+def _alive_proxies(pool: list) -> list:
+    return [item for item in pool if item and not _proxy_skipped(item)]
+
+
 def select_browser_proxy(force_rotate: bool = False) -> str:
-    # 成功则粘滞；失败才换。按成功次数打分，worker 只用自己那一切片，避免 3 个 Chrome 抢同一 IP。
+    # 成功则粘滞；失败才换。先用 worker 自己的切片，切片全挂再借用共享池。
     global _browser_proxy, _proxy_index
-    alive = [item for item in _proxy_pool if not _proxy_skipped(item)]
+    alive = _alive_proxies(_proxy_pool)
     if not alive:
-        if any(_proxy_stat(item)["fail_streak"] for item in _proxy_pool):
-            print("[Warn] 当前切片代理都跳过过，清空连续失败后重试")
-            for item in _proxy_pool:
+        alive = _alive_proxies(_proxy_fallback_pool)
+        if alive:
+            print("[Warn] 独占切片出口已跳过，改用共享池")
+    if not alive:
+        pools = list(dict.fromkeys(list(_proxy_pool) + list(_proxy_fallback_pool)))
+        if any(_proxy_stat(item)["fail_streak"] for item in pools):
+            print("[Warn] 当前可用代理都跳过过，清空连续失败后重试")
+            for item in pools:
                 _proxy_stat(item)["fail_streak"] = 0
-        alive = list(_proxy_pool)
+        alive = list(_proxy_pool) or list(_proxy_fallback_pool)
     if not alive:
         _browser_proxy = ""
         return ""
@@ -229,7 +239,7 @@ def select_browser_proxy(force_rotate: bool = False) -> str:
     stat = _proxy_stat(proxy)
     print(
         f"[*] 本轮浏览器代理: {proxy} "
-        f"(成功 {stat['success']} / 连续失败 {stat['fail_streak']}，候选 {len(alive)}/{len(_proxy_pool)})"
+        f"(成功 {stat['success']} / 连续失败 {stat['fail_streak']}，候选 {len(alive)}/{len(_proxy_pool) or len(_proxy_fallback_pool)})"
     )
     return proxy
 
@@ -2083,8 +2093,8 @@ def run_batch_rounds(count, output_path, extract_numbers=False, worker_id=None):
         stop_browser()
 
 
-def _mp_worker_main(worker_id, count, output_path, extract_numbers, proxies, result_queue):
-    global run_logger, _proxy_pool, _proxy_index, _browser_proxy, _proxy_dead, _proxy_stats
+def _mp_worker_main(worker_id, count, output_path, extract_numbers, proxies, fallback, result_queue):
+    global run_logger, _proxy_pool, _proxy_fallback_pool, _proxy_index, _browser_proxy, _proxy_dead, _proxy_stats
     os.environ["GROK_REGISTER_MP_WORKER"] = "1"
     try:
         sys.stdout.reconfigure(line_buffering=True)
@@ -2093,11 +2103,15 @@ def _mp_worker_main(worker_id, count, output_path, extract_numbers, proxies, res
         pass
     run_logger = setup_run_logger()
     _proxy_pool = list(proxies or [])
+    _proxy_fallback_pool = list(fallback or [])
     _proxy_index = 0
     _browser_proxy = ""
     _proxy_dead = set()
     _proxy_stats.clear()
-    print(f"[W{worker_id}] 启动，配额 {count} 轮，独占代理 {len(_proxy_pool)} 条")
+    print(
+        f"[W{worker_id}] 启动，配额 {count} 轮，独占代理 {len(_proxy_pool)} 条，"
+        f"共享兜底 {len(_proxy_fallback_pool)} 条"
+    )
     success = fail = 0
     try:
         success, fail, _ = run_batch_rounds(
@@ -2139,7 +2153,7 @@ def _run_multiprocess(args):
                 assigned = list(_proxy_pool)
             proc = ctx.Process(
                 target=_mp_worker_main,
-                args=(i, quota, args.output, args.extract_numbers, assigned, result_queue),
+                args=(i, quota, args.output, args.extract_numbers, assigned, list(_proxy_pool), result_queue),
                 name=f"register-w{i}",
             )
             proc.start()
