@@ -1628,9 +1628,11 @@ def _parse_grok2api_sse(text: str, action: str) -> dict:
     return completed
 
 
-def _read_grok2api_sse(resp, action: str) -> dict:
+def _read_grok2api_sse(resp, action: str, deadline: float = 0.0) -> dict:
     chunks = []
     for line in resp.iter_lines(decode_unicode=True):
+        if deadline and time.time() > deadline:
+            raise Exception(f"grok2api {action}超时")
         if line:
             chunks.append(line)
     return _parse_grok2api_sse("\n".join(chunks), action)
@@ -1732,9 +1734,10 @@ def _convert_web_to_build(api_base: str, access: str, *, ids=None, convert_all: 
         if not ids:
             return {"created": 0, "linked": 0, "skipped": 0, "failed": 0, "synced": 0, "syncFailed": 0}
         body["ids"] = ids
-        timeout = min(max(180, 90 * len(ids)), 30 * 60)
+        timeout = 90
     last_error = ""
-    for attempt in range(3):
+    attempts = 1 if convert_all else 2
+    for attempt in range(attempts):
         try:
             resp = requests.post(
                 api_base + "/accounts/web/convert-to-build",
@@ -1749,29 +1752,25 @@ def _convert_web_to_build(api_base: str, access: str, *, ids=None, convert_all: 
             )
             if not 200 <= resp.status_code < 300:
                 raise Exception(f"grok2api Web 转 Build 失败: HTTP {resp.status_code}")
-            return _read_grok2api_sse(resp, "Web 转 Build")
+            return _read_grok2api_sse(resp, "Web 转 Build", deadline=time.time() + timeout)
         except Exception as exc:
             last_error = str(exc)
-            if attempt >= 2:
+            if attempt >= attempts - 1:
                 break
             time.sleep(2 * (attempt + 1))
     raise Exception(last_error or "grok2api Web 转 Build 失败")
 
 
 def _convert_imported_web_to_build(api_base: str, access: str, imported: int) -> None:
-    recent_ids = _list_unlinked_web_ids(api_base, access, recent_seconds=30 * 60, limit=1000)
-    if recent_ids:
-        result = _convert_web_to_build(api_base, access, ids=recent_ids)
-    elif imported >= 20:
-        result = _convert_web_to_build(api_base, access, convert_all=True)
-    elif imported > 0:
-        result = _convert_web_to_build(
-            api_base,
-            access,
-            ids=_list_unlinked_web_ids(api_base, access, limit=min(imported, 1000)),
-        )
-    else:
+    if imported <= 0:
         return
+    # 只转本轮刚导入的少量号。把 30 分钟内未关联号整批丢进 convert 会卡住注册。
+    ids = _list_unlinked_web_ids(
+        api_base, access, recent_seconds=15 * 60, limit=min(max(imported, 1), 3)
+    )
+    if not ids:
+        return
+    result = _convert_web_to_build(api_base, access, ids=ids)
     print(
         "[*] 已转换 grok2api Grok Build: created={created} linked={linked} "
         "skipped={skipped} failed={failed} synced={synced} syncFailed={syncFailed}".format(
@@ -1784,10 +1783,6 @@ def _convert_imported_web_to_build(api_base: str, access: str, imported: int) ->
         )
     )
     if int(result.get("failed") or 0) or int(result.get("syncFailed") or 0):
-        created = int(result.get("created") or 0)
-        linked = int(result.get("linked") or 0)
-        if created + linked <= 0:
-            raise Exception("Web 已导入，但转 Build 未全部成功")
         print("[Warn] 部分 Web 转 Build 未成功，下一轮会重试未关联号")
 
 
@@ -1828,7 +1823,10 @@ def push_sso_to_grok2api_go(new_tokens: list, api_conf: dict) -> bool:
         if sync_failed:
             raise Exception("SSO 已导入，但初始同步失败")
         if _convert_to_build_enabled(api_conf):
-            _convert_imported_web_to_build(api_base, access, created + updated)
+            try:
+                _convert_imported_web_to_build(api_base, access, created + updated)
+            except Exception as convert_exc:
+                print(f"[Warn] Web 已导入，转 Build 失败（下一轮会重试）: {convert_exc}")
         return True
     raise Exception(last_error or "grok2api 管理员认证已失效")
 
