@@ -2031,7 +2031,11 @@ def run_batch_rounds(count, output_path, extract_numbers=False, worker_id=None):
                 fail_count += 1
                 print(f"[Error] {prefix}第 {current_round} 轮失败: {error}")
                 err_text = str(error)
-                if any(marker in err_text for marker in ("Turnstile", "未找到最终注册表单", "人机", "Cloudflare", "超时")):
+                email_only = any(
+                    marker in err_text
+                    for marker in ("DuckMail", "验证码", "邮箱被拒", "邮箱域名", "邮件")
+                )
+                if not email_only:
                     mark_proxy_dead(err_text.split("\n", 1)[0][:120])
                 if run_logger:
                     run_logger.error(
