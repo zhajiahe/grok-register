@@ -1774,7 +1774,11 @@ def _convert_imported_web_to_build(api_base: str, access: str, imported: int) ->
         )
     )
     if int(result.get("failed") or 0) or int(result.get("syncFailed") or 0):
-        raise Exception("Web 已导入，但转 Build 未全部成功")
+        created = int(result.get("created") or 0)
+        linked = int(result.get("linked") or 0)
+        if created + linked <= 0:
+            raise Exception("Web 已导入，但转 Build 未全部成功")
+        print("[Warn] 部分 Web 转 Build 未成功，下一轮会重试未关联号")
 
 
 def push_sso_to_grok2api_go(new_tokens: list, api_conf: dict) -> bool:
