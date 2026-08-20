@@ -1723,20 +1723,29 @@ def _convert_web_to_build(api_base: str, access: str, *, ids=None, convert_all: 
             return {"created": 0, "linked": 0, "skipped": 0, "failed": 0, "synced": 0, "syncFailed": 0}
         body["ids"] = ids
         timeout = min(max(180, 90 * len(ids)), 30 * 60)
-    resp = requests.post(
-        api_base + "/accounts/web/convert-to-build",
-        headers={
-            "Authorization": f"Bearer {access}",
-            "Accept": "text/event-stream",
-            "Content-Type": "application/json",
-        },
-        json=body,
-        timeout=timeout,
-        stream=True,
-    )
-    if not 200 <= resp.status_code < 300:
-        raise Exception(f"grok2api Web 转 Build 失败: HTTP {resp.status_code}")
-    return _read_grok2api_sse(resp, "Web 转 Build")
+    last_error = ""
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                api_base + "/accounts/web/convert-to-build",
+                headers={
+                    "Authorization": f"Bearer {access}",
+                    "Accept": "text/event-stream",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=timeout,
+                stream=True,
+            )
+            if not 200 <= resp.status_code < 300:
+                raise Exception(f"grok2api Web 转 Build 失败: HTTP {resp.status_code}")
+            return _read_grok2api_sse(resp, "Web 转 Build")
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt >= 2:
+                break
+            time.sleep(2 * (attempt + 1))
+    raise Exception(last_error or "grok2api Web 转 Build 失败")
 
 
 def _convert_imported_web_to_build(api_base: str, access: str, imported: int) -> None:
