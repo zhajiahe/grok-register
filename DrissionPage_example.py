@@ -101,6 +101,12 @@ _browser_proxy = ""
 _proxy_pool: list = []
 _proxy_index = 0
 _proxy_dead: set = set()
+_proxy_stats: dict = {}
+_PROXY_FAIL_STRIKES = 2
+_CF_ZERO_TOKEN_SECONDS = 8
+_email_prefetch_lock = threading.Lock()
+_email_prefetch_future = None
+_email_prefetch_pool = None
 
 
 def _normalize_proxy(raw) -> str:
@@ -179,33 +185,76 @@ def _preflight_proxy_pool(proxies: list) -> list:
     return proxies
 
 
+def _proxy_stat(proxy: str) -> dict:
+    stat = _proxy_stats.get(proxy)
+    if stat is None:
+        stat = {"success": 0, "fail_streak": 0}
+        _proxy_stats[proxy] = stat
+    return stat
+
+
+def _proxy_skipped(proxy: str) -> bool:
+    return _proxy_stat(proxy)["fail_streak"] >= _PROXY_FAIL_STRIKES
+
+
 def select_browser_proxy(force_rotate: bool = False) -> str:
-    # 成功轮次粘滞当前代理，避免每轮换 IP 还要重启 Chrome。
+    # 成功则粘滞；失败才换。按成功次数打分，worker 只用自己那一切片，避免 3 个 Chrome 抢同一 IP。
     global _browser_proxy, _proxy_index
-    alive = [item for item in _proxy_pool if item not in _proxy_dead]
+    alive = [item for item in _proxy_pool if not _proxy_skipped(item)]
     if not alive:
-        if _proxy_dead:
-            print("[Warn] 代理池全部失败过，清空失败标记后重试")
-            _proxy_dead.clear()
+        if any(_proxy_stat(item)["fail_streak"] for item in _proxy_pool):
+            print("[Warn] 当前切片代理都跳过过，清空连续失败后重试")
+            for item in _proxy_pool:
+                _proxy_stat(item)["fail_streak"] = 0
         alive = list(_proxy_pool)
     if not alive:
         _browser_proxy = ""
         return ""
     if _browser_proxy and _browser_proxy in alive and not force_rotate:
         return _browser_proxy
-    proxy = alive[_proxy_index % len(alive)]
+
+    ranked = sorted(
+        alive,
+        key=lambda item: (
+            -_proxy_stat(item)["success"],
+            _proxy_pool.index(item) if item in _proxy_pool else 999,
+        ),
+    )
+    if force_rotate and _browser_proxy in ranked and len(ranked) > 1:
+        ranked = [item for item in ranked if item != _browser_proxy] or ranked
+    proxy = ranked[0]
     _proxy_index += 1
     _browser_proxy = proxy
-    print(f"[*] 本轮浏览器代理: {proxy} ({((_proxy_index - 1) % len(alive)) + 1}/{len(alive)})")
+    stat = _proxy_stat(proxy)
+    print(
+        f"[*] 本轮浏览器代理: {proxy} "
+        f"(成功 {stat['success']} / 连续失败 {stat['fail_streak']}，候选 {len(alive)}/{len(_proxy_pool)})"
+    )
     return proxy
 
 
-def mark_proxy_dead(reason: str = "") -> None:
+def note_proxy_success() -> None:
     if not _browser_proxy:
         return
-    _proxy_dead.add(_browser_proxy)
+    stat = _proxy_stat(_browser_proxy)
+    stat["success"] += 1
+    stat["fail_streak"] = 0
+
+
+def mark_proxy_dead(reason: str = "") -> None:
+    # 连续两次 CF/表单失败才跳过，避免好 IP 被单次超时误伤。
+    if not _browser_proxy:
+        return
+    stat = _proxy_stat(_browser_proxy)
+    stat["fail_streak"] += 1
     extra = f" ({reason})" if reason else ""
-    print(f"[Warn] 代理标记失败并跳过: {_browser_proxy}{extra}")
+    if stat["fail_streak"] >= _PROXY_FAIL_STRIKES:
+        print(f"[Warn] 代理连续失败 {stat['fail_streak']} 次，暂时跳过: {_browser_proxy}{extra}")
+    else:
+        print(
+            f"[Warn] 代理本轮失败 {stat['fail_streak']}/{_PROXY_FAIL_STRIKES}，下次换出口: "
+            f"{_browser_proxy}{extra}"
+        )
 
 
 _proxy_pool = _load_proxy_pool()
@@ -476,6 +525,44 @@ return otp;
     return "pending"
 
 
+def _email_prefetch_executor():
+    global _email_prefetch_pool
+    if _email_prefetch_pool is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _email_prefetch_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="email-prefetch")
+    return _email_prefetch_pool
+
+
+def prefetch_signup_email(exclude_domains=None):
+    # 等 Turnstile / OTP 时后台先开下一封 DuckMail，下一轮少等 1–3 秒。
+    global _email_prefetch_future
+    excluded = list(exclude_domains or [])
+    with _email_prefetch_lock:
+        if _email_prefetch_future is not None and not _email_prefetch_future.done():
+            return
+        _email_prefetch_future = _email_prefetch_executor().submit(get_email_and_token, excluded)
+
+
+def take_signup_email(exclude_domains=None):
+    global _email_prefetch_future
+    with _email_prefetch_lock:
+        future = _email_prefetch_future
+        _email_prefetch_future = None
+    excluded = [str(item).strip().lstrip("@").lower() for item in (exclude_domains or []) if item]
+    if future is not None:
+        try:
+            email, token = future.result(timeout=20)
+            domain = email.split("@")[-1].lower() if email and "@" in email else ""
+            if email and token and domain not in excluded:
+                prefetch_signup_email(exclude_domains)
+                return email, token
+        except Exception as exc:
+            print(f"[Debug] 预取邮箱不可用，改为现取: {exc}")
+    email, token = get_email_and_token(exclude_domains=exclude_domains)
+    prefetch_signup_email(exclude_domains)
+    return email, token
+
+
 def fill_email_and_submit(timeout=45):
     # 复用 `email_register.py` 里的邮箱获取逻辑；x.ai 会拒绝 duckmail.sbs，被拒后自动换域重试。
     excluded_domains: list = []
@@ -483,7 +570,7 @@ def fill_email_and_submit(timeout=45):
     attempt_deadline = time.time() + timeout
 
     while time.time() < attempt_deadline:
-        email, dev_token = get_email_and_token(exclude_domains=excluded_domains)
+        email, dev_token = take_signup_email(exclude_domains=excluded_domains)
         if not email or not dev_token:
             raise Exception(last_error)
 
@@ -639,6 +726,7 @@ return true;
 
 def fill_code_and_submit(email, dev_token, timeout=180):
     # 复用 `email_register.py` 里的验证码轮询逻辑，等待邮件到达后自动填写 OTP。
+    prefetch_signup_email()
     code = get_oai_code(dev_token, email, timeout=180)
     if not code:
         raise Exception("获取验证码失败")
@@ -907,7 +995,7 @@ return { url: location.href, inputs, buttons };
     raise Exception("未找到验证码输入框或确认邮箱按钮")
 
 
-def getTurnstileToken():
+def getTurnstileToken(max_tries=8):
     # 对齐 AaronL725/grok-register：token 长度 >= 80 才算通过；先等自动签发，卡住再点 checkbox。
     if page is None:
         raise Exception("页面未就绪，无法执行 Turnstile")
@@ -920,7 +1008,7 @@ def getTurnstileToken():
         pass
 
     last_error = ""
-    for i in range(8):
+    for i in range(max(1, int(max_tries))):
         try:
             if page is None:
                 refresh_active_page()
@@ -981,7 +1069,7 @@ if (nodes.length && typeof nodes[0].click === 'function') nodes[0].click();
                     """
                 )
             if i == 0 or i % 4 == 3:
-                print(f"[*] 等待 Turnstile token（{i + 1}/8）")
+                print(f"[*] 等待 Turnstile token（{i + 1}/{max_tries}）")
         except PageDisconnectedError as error:
             last_error = str(error)
             print("[Debug] Turnstile 检测时页面断开，刷新标签页后继续")
@@ -1198,13 +1286,18 @@ return value.length >= 80 ? 'ready' : ('pending:' + value.length);
             if isinstance(turnstile_state, str) and turnstile_state.startswith("pending"):
                 token_len = turnstile_state.split(":", 1)[1] if ":" in turnstile_state else "0"
                 now = time.time()
+                try:
+                    token_len_int = int(token_len)
+                except Exception:
+                    token_len_int = 0
                 if wait_cf_since is None:
                     wait_cf_since = now
                     print(f"[*] 资料已填写，等待 Cloudflare 自动通过... 当前token长度={token_len}")
-                if now - wait_cf_since >= 7 and now - last_cf_retry_at >= 5:
-                    print("[*] Cloudflare 验证卡住，开始二次复用 Turnstile...")
+                    prefetch_signup_email()
+                if token_len_int < 80 and last_cf_retry_at == 0.0:
+                    print("[*] Cloudflare 未自动签发，立即复用 Turnstile...")
                     try:
-                        turnstile_token = getTurnstileToken()
+                        turnstile_token = getTurnstileToken(max_tries=4)
                         if turnstile_token:
                             synced = page.run_js(
                                 """
@@ -1226,10 +1319,15 @@ return String(challengeInput.value || '').trim().length;
                                 turnstile_token,
                             )
                             print(f"[*] Turnstile 二次复用完成，回填长度={synced}")
+                            if int(synced or 0) >= 80:
+                                last_cf_retry_at = now
+                                continue
                     except Exception as cf_exc:
                         print(f"[Debug] Turnstile 二次复用失败: {cf_exc}")
                     last_cf_retry_at = now
-                time.sleep(0.8)
+                if token_len_int < 80 and now - wait_cf_since >= _CF_ZERO_TOKEN_SECONDS:
+                    raise Exception("Cloudflare token 持续为 0，换代理")
+                time.sleep(0.5)
                 continue
 
             time.sleep(1.2)
@@ -1651,6 +1749,7 @@ def push_sso_to_api(new_tokens: list):
 
 def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False):
     # 单轮流程：打开注册页 -> 完成注册 -> 获取 sso -> 写 txt。
+    prefetch_signup_email()
     open_signup_page()
     email, dev_token = fill_email_and_submit()
     fill_code_and_submit(email, dev_token)
@@ -1758,6 +1857,7 @@ def run_batch_rounds(count, output_path, extract_numbers=False, worker_id=None):
                 collected_sso.append(result["sso"])
                 success_count += 1
                 reuse_ok = True
+                note_proxy_success()
                 try:
                     push_sso_to_api([result["sso"]])
                 except Exception as push_exc:
@@ -1814,7 +1914,7 @@ def run_batch_rounds(count, output_path, extract_numbers=False, worker_id=None):
 
 
 def _mp_worker_main(worker_id, count, output_path, extract_numbers, proxies, result_queue):
-    global run_logger, _proxy_pool, _proxy_index, _browser_proxy, _proxy_dead
+    global run_logger, _proxy_pool, _proxy_index, _browser_proxy, _proxy_dead, _proxy_stats
     os.environ["GROK_REGISTER_MP_WORKER"] = "1"
     try:
         sys.stdout.reconfigure(line_buffering=True)
@@ -1823,10 +1923,11 @@ def _mp_worker_main(worker_id, count, output_path, extract_numbers, proxies, res
         pass
     run_logger = setup_run_logger()
     _proxy_pool = list(proxies or [])
-    _proxy_index = int(worker_id or 0)
+    _proxy_index = 0
     _browser_proxy = ""
     _proxy_dead = set()
-    print(f"[W{worker_id}] 启动，配额 {count} 轮，代理 {len(_proxy_pool)} 条，起始序号 {_proxy_index}")
+    _proxy_stats.clear()
+    print(f"[W{worker_id}] 启动，配额 {count} 轮，独占代理 {len(_proxy_pool)} 条")
     success = fail = 0
     try:
         success, fail, _ = run_batch_rounds(
@@ -1863,7 +1964,9 @@ def _run_multiprocess(args):
         for i, quota in enumerate(counts):
             if quota <= 0:
                 continue
-            assigned = list(_proxy_pool)
+            assigned = _proxy_pool[i::n] if _proxy_pool else []
+            if _proxy_pool and not assigned:
+                assigned = list(_proxy_pool)
             proc = ctx.Process(
                 target=_mp_worker_main,
                 args=(i, quota, args.output, args.extract_numbers, assigned, result_queue),
@@ -1871,7 +1974,7 @@ def _run_multiprocess(args):
             )
             proc.start()
             procs.append(proc)
-            print(f"[*] 已启动 worker {i}，配额 {quota}，共享代理 {len(assigned)} 条")
+            print(f"[*] 已启动 worker {i}，配额 {quota}，独占代理 {len(assigned)} 条")
             if i + 1 < n:
                 time.sleep(2)
     finally:
