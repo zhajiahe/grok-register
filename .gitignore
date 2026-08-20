@@ -1,7 +1,11 @@
 __pycache__/
 *.pyc
-logs/
-sso/
+.venv/
+.python-version
+logs/*
+!logs/.gitkeep
+sso/*
+!sso/.gitkeep
 chrome_data/
 config.json
 node_modules/

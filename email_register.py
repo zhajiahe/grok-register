@@ -1,4 +1,5 @@
 
+"""DuckMail 临时邮箱：创建地址并轮询 x.ai 注册验证码。"""
 from __future__ import annotations
 
 import json
@@ -42,7 +43,7 @@ else:
     DUCKMAIL_EXCLUDE_DOMAINS = {str(d).strip().lstrip("@").lower() for d in _configured_exclude if str(d).strip()}
 
 # ============================================================
-# 适配层：为 DrissionPage_example.py 提供简单接口
+# 适配层：供 register.py 调用。
 # ============================================================
 
 _temp_email_cache: Dict[str, str] = {}
@@ -53,7 +54,7 @@ def get_email_and_token(
 ) -> Tuple[Optional[str], Optional[str]]:
     """
     创建 DuckMail 临时邮箱并返回 (email, mail_token)。
-    供 DrissionPage_example.py 调用。
+    供 register.py 调用。
     """
     email, _password, mail_token = create_temp_email(exclude_domains=exclude_domains)
     if email and mail_token:
@@ -65,7 +66,7 @@ def get_email_and_token(
 def get_oai_code(dev_token: str, email: str, timeout: int = 90) -> Optional[str]:
     """
     轮询 DuckMail 获取 OTP 验证码。
-    供 DrissionPage_example.py 调用。
+    供 register.py 调用。
 
     Returns:
         验证码字符串（去除连字符，如 "MM0SF3"）或 None

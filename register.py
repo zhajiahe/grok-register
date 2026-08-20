@@ -1,3 +1,4 @@
+"""Grok / x.ai 批量注册入口：Chrome + DuckMail，把 sso cookie 写入文本。"""
 from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
 import argparse
@@ -2011,7 +2012,7 @@ def main():
 
     config_count = load_run_count()
 
-    parser = argparse.ArgumentParser(description="xAI 自动注册并采集 sso")
+    parser = argparse.ArgumentParser(description="Grok / x.ai 自动注册并采集 sso")
     parser.add_argument("--count", type=int, default=config_count, help=f"执行轮数，0 表示无限循环（默认读取 config.json run.count，当前 {config_count}）")
     parser.add_argument("--output", default=DEFAULT_SSO_FILE, help="sso 输出 txt 路径")
     parser.add_argument("--extract-numbers", action="store_true", help="注册完成后额外提取页面数字文本")

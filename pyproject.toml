@@ -1,0 +1,14 @@
+[project]
+name = "grok-register"
+version = "0.1.0"
+description = "批量注册 Grok Web 账号并采集 SSO"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "DrissionPage>=4.1.1.2,<4.2",
+    "curl_cffi>=0.7.0",
+    "requests>=2.32.0",
+]
+
+[project.optional-dependencies]
+linux = ["PyVirtualDisplay>=3.0"]
