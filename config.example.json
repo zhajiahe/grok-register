@@ -1,6 +1,7 @@
 {
     "run": {
-        "count": 10
+        "count": 10,
+        "workers": 1
     },
     "duckmail_api_base": "https://api.duckmail.sbs",
     "duckmail_bearer": "<your_duckmail_bearer_token>",

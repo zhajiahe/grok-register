@@ -1,2 +1,4 @@
 DrissionPage>=4.1.1.2,<4.2
 curl_cffi>=0.7.0
+requests>=2.32.0
+PyVirtualDisplay>=3.0; sys_platform == "linux"
