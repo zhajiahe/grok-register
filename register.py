@@ -1702,6 +1702,14 @@ def _convert_to_build_enabled(api_conf: dict) -> bool:
     return bool(api_conf.get("convert_to_build"))
 
 
+def _sync_to_console_enabled(api_conf: dict) -> bool:
+    if os.environ.get("GROK_REGISTER_SYNC_TO_CONSOLE") == "0":
+        return False
+    if "sync_to_console" not in api_conf:
+        return True
+    return bool(api_conf.get("sync_to_console"))
+
+
 def _parse_iso_datetime(value: str):
     text = str(value or "").strip()
     if not text:
@@ -1730,7 +1738,14 @@ def _parse_iso_datetime(value: str):
     return None
 
 
-def _list_unlinked_web_ids(api_base: str, access: str, *, recent_seconds: int = 0, limit: int = 1000) -> list:
+def _list_unlinked_web_ids(
+    api_base: str,
+    access: str,
+    *,
+    association: str = "buildUnlinked",
+    recent_seconds: int = 0,
+    limit: int = 1000,
+) -> list:
     import requests
 
     ids = []
@@ -1747,7 +1762,7 @@ def _list_unlinked_web_ids(api_base: str, access: str, *, recent_seconds: int = 
                 "page": page,
                 "pageSize": page_size,
                 "provider": "grok_web",
-                "association": "buildUnlinked",
+                "association": association,
                 "sortBy": "createdAt",
                 "sortOrder": "desc",
             },
@@ -1842,6 +1857,71 @@ def _convert_imported_web_to_build(api_base: str, access: str, imported: int) ->
         print("[Warn] 部分 Web 转 Build 未成功，下一轮会重试未关联号")
 
 
+def _sync_web_to_console(api_base: str, access: str, *, ids=None, sync_all: bool = False) -> dict:
+    import requests
+
+    body = {"strategy": "missing"}
+    if sync_all:
+        body["all"] = True
+        timeout = 6 * 60 * 60
+    else:
+        ids = [str(item).strip() for item in (ids or []) if str(item).strip()]
+        if not ids:
+            return {"created": 0, "updated": 0, "skipped": 0, "synced": 0, "syncFailed": 0}
+        body["ids"] = ids
+        timeout = 45
+    last_error = ""
+    for attempt in range(2):
+        try:
+            resp = requests.post(
+                api_base + "/accounts/web/sync-to-console",
+                headers={
+                    "Authorization": f"Bearer {access}",
+                    "Accept": "text/event-stream",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=timeout,
+                stream=True,
+            )
+            if not 200 <= resp.status_code < 300:
+                raise Exception(f"grok2api Web 同步 Console 失败: HTTP {resp.status_code}")
+            return _read_grok2api_sse(resp, "Web 同步 Console", deadline=time.time() + timeout)
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt >= 1:
+                break
+            time.sleep(2 * (attempt + 1))
+    raise Exception(last_error or "grok2api Web 同步 Console 失败")
+
+
+def _sync_imported_web_to_console(api_base: str, access: str, imported: int) -> None:
+    if imported <= 0:
+        return
+    ids = _list_unlinked_web_ids(
+        api_base,
+        access,
+        association="consoleUnlinked",
+        recent_seconds=15 * 60,
+        limit=min(max(imported, 1), 3),
+    )
+    if not ids:
+        return
+    result = _sync_web_to_console(api_base, access, ids=ids)
+    print(
+        "[*] 已同步 grok2api Grok Console: created={created} updated={updated} "
+        "skipped={skipped} synced={synced} syncFailed={syncFailed}".format(
+            created=int(result.get("created") or 0),
+            updated=int(result.get("updated") or 0),
+            skipped=int(result.get("skipped") or 0),
+            synced=int(result.get("synced") or 0),
+            syncFailed=int(result.get("syncFailed") or 0),
+        )
+    )
+    if int(result.get("syncFailed") or 0):
+        print("[Warn] 部分 Web 同步 Console 未成功，下一轮会重试未关联号")
+
+
 def push_sso_to_grok2api_go(new_tokens: list, api_conf: dict) -> bool:
     import requests
 
@@ -1883,6 +1963,11 @@ def push_sso_to_grok2api_go(new_tokens: list, api_conf: dict) -> bool:
                 _convert_imported_web_to_build(api_base, access, created + updated)
             except Exception as convert_exc:
                 print(f"[Warn] Web 已导入，转 Build 失败（下一轮会重试）: {convert_exc}")
+        if _sync_to_console_enabled(api_conf):
+            try:
+                _sync_imported_web_to_console(api_base, access, created + updated)
+            except Exception as sync_exc:
+                print(f"[Warn] Web 已导入，同步 Console 失败（下一轮会重试）: {sync_exc}")
         return True
     raise Exception(last_error or "grok2api 管理员认证已失效")
 
@@ -2314,6 +2399,11 @@ def main():
         help="导入 grok2api 后不要转成 Grok Build（默认会转）",
     )
     parser.add_argument(
+        "--no-sync-to-console",
+        action="store_true",
+        help="导入 grok2api 后不要同步成 Grok Console（默认会同步）",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=load_run_workers(),
@@ -2322,6 +2412,8 @@ def main():
     args = parser.parse_args()
     if args.no_convert_to_build:
         os.environ["GROK_REGISTER_CONVERT_TO_BUILD"] = "0"
+    if args.no_sync_to_console:
+        os.environ["GROK_REGISTER_SYNC_TO_CONSOLE"] = "0"
 
     if args.push_sso:
         path = os.path.abspath(args.push_sso)
