@@ -8,6 +8,7 @@ import multiprocessing as mp
 import platform
 import datetime
 import logging
+import queue
 import threading
 import time
 import os
@@ -100,6 +101,7 @@ EXTENSION_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "turnst
 
 _browser_proxy = ""
 _proxy_pool: list = []
+_proxy_fallback_pool: list = []
 _proxy_index = 0
 _proxy_dead: set = set()
 _proxy_stats: dict = {}
@@ -198,16 +200,25 @@ def _proxy_skipped(proxy: str) -> bool:
     return _proxy_stat(proxy)["fail_streak"] >= _PROXY_FAIL_STRIKES
 
 
+def _alive_proxies(pool: list) -> list:
+    return [item for item in pool if item and not _proxy_skipped(item)]
+
+
 def select_browser_proxy(force_rotate: bool = False) -> str:
-    # 成功则粘滞；失败才换。按成功次数打分，worker 只用自己那一切片，避免 3 个 Chrome 抢同一 IP。
+    # 成功则粘滞；失败才换。先用 worker 自己的切片，切片全挂再借用共享池。
     global _browser_proxy, _proxy_index
-    alive = [item for item in _proxy_pool if not _proxy_skipped(item)]
+    alive = _alive_proxies(_proxy_pool)
     if not alive:
-        if any(_proxy_stat(item)["fail_streak"] for item in _proxy_pool):
-            print("[Warn] 当前切片代理都跳过过，清空连续失败后重试")
-            for item in _proxy_pool:
+        alive = _alive_proxies(_proxy_fallback_pool)
+        if alive:
+            print("[Warn] 独占切片出口已跳过，改用共享池")
+    if not alive:
+        pools = list(dict.fromkeys(list(_proxy_pool) + list(_proxy_fallback_pool)))
+        if any(_proxy_stat(item)["fail_streak"] for item in pools):
+            print("[Warn] 当前可用代理都跳过过，清空连续失败后重试")
+            for item in pools:
                 _proxy_stat(item)["fail_streak"] = 0
-        alive = list(_proxy_pool)
+        alive = list(_proxy_pool) or list(_proxy_fallback_pool)
     if not alive:
         _browser_proxy = ""
         return ""
@@ -229,7 +240,7 @@ def select_browser_proxy(force_rotate: bool = False) -> str:
     stat = _proxy_stat(proxy)
     print(
         f"[*] 本轮浏览器代理: {proxy} "
-        f"(成功 {stat['success']} / 连续失败 {stat['fail_streak']}，候选 {len(alive)}/{len(_proxy_pool)})"
+        f"(成功 {stat['success']} / 连续失败 {stat['fail_streak']}，候选 {len(alive)}/{len(_proxy_pool) or len(_proxy_fallback_pool)})"
     )
     return proxy
 
@@ -346,19 +357,79 @@ def start_browser(force_rotate: bool = False):
     raise Exception(f"浏览器启动失败，已重试{attempts}次: {last_exc}")
 
 
+def _kill_pid(pid: int) -> None:
+    if not pid:
+        return
+    try:
+        os.kill(int(pid), 9)
+    except Exception:
+        pass
+
+
+def _kill_chrome_by_profile(profile_dir: str, pid: int = 0) -> None:
+    # quit() 卡在 CDP 时，按 user-data-dir 杀掉本 worker 的 Chrome，避免整轮挂死。
+    _kill_pid(pid)
+    marker = str(profile_dir or "").strip()
+    if not marker or "DrissionPage" not in marker:
+        return
+    try:
+        names = os.listdir("/proc")
+    except Exception:
+        return
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(os.path.join("/proc", name, "cmdline"), "rb") as handle:
+                cmd = handle.read().replace(b"\x00", b" ").decode("utf-8", "ignore")
+        except Exception:
+            continue
+        if marker not in cmd:
+            continue
+        lower = cmd.lower()
+        if "chrome" not in lower and "chromium" not in lower:
+            continue
+        _kill_pid(int(name))
+
+
 def stop_browser():
     # 完整关闭浏览器，del_data=True 让 DrissionPage 清掉 auto_port 分配的临时 profile。
+    # quit() 本身也可能卡在 CDP，必须限时，超时就杀进程。
     global browser, page
-    if browser is not None:
-        try:
-            try:
-                browser.quit(del_data=True)
-            except TypeError:
-                browser.quit()
-        except Exception:
-            pass
+    instance = browser
     browser = None
     page = None
+    if instance is None:
+        return
+    profile_dir = ""
+    pid = 0
+    try:
+        profile_dir = str(getattr(instance, "user_data_path", "") or "")
+    except Exception:
+        profile_dir = ""
+    try:
+        pid = int(getattr(instance, "process_id", 0) or 0)
+    except Exception:
+        pid = 0
+
+    done = threading.Event()
+
+    def _quit():
+        try:
+            try:
+                instance.quit(del_data=True)
+            except TypeError:
+                instance.quit()
+        except Exception:
+            pass
+        done.set()
+
+    threading.Thread(target=_quit, daemon=True, name="chrome-quit").start()
+    if done.wait(3):
+        return
+    print("[Warn] Chrome 正常退出超时，改为强制结束进程")
+    _kill_chrome_by_profile(profile_dir, pid)
+    done.wait(2)
 
 
 def restart_browser(force_rotate: bool = True):
@@ -725,14 +796,14 @@ return true;
 
 
 
-def fill_code_and_submit(email, dev_token, timeout=180):
+def fill_code_and_submit(email, dev_token, timeout=90):
     # 复用 `email_register.py` 里的验证码轮询逻辑，等待邮件到达后自动填写 OTP。
     prefetch_signup_email()
-    code = get_oai_code(dev_token, email, timeout=180)
+    code = get_oai_code(dev_token, email, timeout=timeout)
     if not code:
         raise Exception("获取验证码失败")
 
-    deadline = time.time() + timeout
+    deadline = time.time() + 25
     while time.time() < deadline:
         try:
             filled = page.run_js(
@@ -996,8 +1067,17 @@ return { url: location.href, inputs, buttons };
     raise Exception("未找到验证码输入框或确认邮箱按钮")
 
 
-def getTurnstileToken(max_tries=8):
-    # 对齐 AaronL725/grok-register：token 长度 >= 80 才算通过；先等自动签发，卡住再点 checkbox。
+def _page_ele(locator, timeout=0.8):
+    if page is None:
+        return None
+    try:
+        return page.ele(locator, timeout=timeout)
+    except Exception:
+        return None
+
+
+def getTurnstileToken(max_tries=4):
+    # token 长度 >= 80 才算通过。ele()/shadow iframe 可能卡死 CDP，必须短超时。
     if page is None:
         raise Exception("页面未就绪，无法执行 Turnstile")
 
@@ -1009,7 +1089,10 @@ def getTurnstileToken(max_tries=8):
         pass
 
     last_error = ""
+    deadline = time.time() + 8
     for i in range(max(1, int(max_tries))):
+        if time.time() >= deadline:
+            break
         try:
             if page is None:
                 refresh_active_page()
@@ -1030,12 +1113,12 @@ try {
                 print(f"[*] Turnstile 已通过，token长度={len(token)}")
                 return token
 
-            # 对齐参考实现：用默认超时找 iframe，不要额外 timeout 把页面拖死。
-            challenge_input = page.ele("@name=cf-turnstile-response")
+            challenge_input = _page_ele("@name=cf-turnstile-response", timeout=0.6)
             if challenge_input:
                 iframe = None
                 try:
-                    iframe = challenge_input.parent().shadow_root.ele("tag:iframe")
+                    parent = challenge_input.parent()
+                    iframe = parent.shadow_root.ele("tag:iframe", timeout=0.6) if parent else None
                 except Exception:
                     iframe = None
                 if iframe:
@@ -1053,8 +1136,8 @@ Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sy });
                     except Exception:
                         pass
                     try:
-                        body_sr = iframe.ele("tag:body").shadow_root
-                        btn = body_sr.ele("tag:input")
+                        body = iframe.ele("tag:body", timeout=0.6)
+                        btn = body.shadow_root.ele("tag:input", timeout=0.6) if body else None
                         if btn:
                             btn.click()
                     except Exception as error:
@@ -1069,7 +1152,7 @@ const nodes = Array.from(document.querySelectorAll('div,span,iframe')).filter((n
 if (nodes.length && typeof nodes[0].click === 'function') nodes[0].click();
                     """
                 )
-            if i == 0 or i % 4 == 3:
+            if i == 0 or i + 1 == max_tries:
                 print(f"[*] 等待 Turnstile token（{i + 1}/{max_tries}）")
         except PageDisconnectedError as error:
             last_error = str(error)
@@ -1077,7 +1160,7 @@ if (nodes.length && typeof nodes[0].click === 'function') nodes[0].click();
             refresh_active_page()
         except Exception as error:
             last_error = str(error)
-        time.sleep(1)
+        time.sleep(0.4)
 
     raise Exception(f"Turnstile 获取 token 失败{': ' + last_error if last_error else ''}")
 
@@ -1331,16 +1414,11 @@ return String(challengeInput.value || '').trim().length;
                 time.sleep(0.5)
                 continue
 
-            time.sleep(1.2)
+            time.sleep(0.4)
 
-            try:
-                submit_button = page.ele('tag:button@@text()=完成注册') or page.ele('tag:button@@text():Create Account') or page.ele('tag:button@@text():Sign up')
-            except Exception:
-                submit_button = None
-
-            if not submit_button:
-                clicked = page.run_js(
-                    r"""
+            # 不要用 page.ele 找按钮：默认查找在 CDP 卡住时会把整轮拖死。
+            clicked = page.run_js(
+                r"""
 const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
 if (challengeInput && String(challengeInput.value || '').trim().length < 80) {
     return false;
@@ -1356,20 +1434,8 @@ if (!submitButton || submitButton.disabled || submitButton.getAttribute('aria-di
 submitButton.focus();
 submitButton.click();
 return true;
-                    """
-                )
-            else:
-                challenge_value = page.run_js(
-                    """
-const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
-return challengeInput ? String(challengeInput.value || '').trim() : 'not-found';
-                    """
-                )
-                if len(str(challenge_value or "")) >= 80 or challenge_value == 'not-found':
-                    submit_button.click()
-                    clicked = True
-                else:
-                    clicked = False
+                """
+            )
 
             if clicked:
                 print(f"[*] 已填写注册资料并点击完成注册: {given_name} {family_name} / {password}")
@@ -1618,9 +1684,11 @@ def _parse_grok2api_sse(text: str, action: str) -> dict:
     return completed
 
 
-def _read_grok2api_sse(resp, action: str) -> dict:
+def _read_grok2api_sse(resp, action: str, deadline: float = 0.0) -> dict:
     chunks = []
     for line in resp.iter_lines(decode_unicode=True):
+        if deadline and time.time() > deadline:
+            raise Exception(f"grok2api {action}超时")
         if line:
             chunks.append(line)
     return _parse_grok2api_sse("\n".join(chunks), action)
@@ -1722,9 +1790,10 @@ def _convert_web_to_build(api_base: str, access: str, *, ids=None, convert_all: 
         if not ids:
             return {"created": 0, "linked": 0, "skipped": 0, "failed": 0, "synced": 0, "syncFailed": 0}
         body["ids"] = ids
-        timeout = min(max(180, 90 * len(ids)), 30 * 60)
+        timeout = 45
     last_error = ""
-    for attempt in range(3):
+    attempts = 1 if convert_all else 2
+    for attempt in range(attempts):
         try:
             resp = requests.post(
                 api_base + "/accounts/web/convert-to-build",
@@ -1739,29 +1808,25 @@ def _convert_web_to_build(api_base: str, access: str, *, ids=None, convert_all: 
             )
             if not 200 <= resp.status_code < 300:
                 raise Exception(f"grok2api Web 转 Build 失败: HTTP {resp.status_code}")
-            return _read_grok2api_sse(resp, "Web 转 Build")
+            return _read_grok2api_sse(resp, "Web 转 Build", deadline=time.time() + timeout)
         except Exception as exc:
             last_error = str(exc)
-            if attempt >= 2:
+            if attempt >= attempts - 1:
                 break
             time.sleep(2 * (attempt + 1))
     raise Exception(last_error or "grok2api Web 转 Build 失败")
 
 
 def _convert_imported_web_to_build(api_base: str, access: str, imported: int) -> None:
-    recent_ids = _list_unlinked_web_ids(api_base, access, recent_seconds=30 * 60, limit=1000)
-    if recent_ids:
-        result = _convert_web_to_build(api_base, access, ids=recent_ids)
-    elif imported >= 20:
-        result = _convert_web_to_build(api_base, access, convert_all=True)
-    elif imported > 0:
-        result = _convert_web_to_build(
-            api_base,
-            access,
-            ids=_list_unlinked_web_ids(api_base, access, limit=min(imported, 1000)),
-        )
-    else:
+    if imported <= 0:
         return
+    # 只转本轮刚导入的少量号。把 30 分钟内未关联号整批丢进 convert 会卡住注册。
+    ids = _list_unlinked_web_ids(
+        api_base, access, recent_seconds=15 * 60, limit=min(max(imported, 1), 3)
+    )
+    if not ids:
+        return
+    result = _convert_web_to_build(api_base, access, ids=ids)
     print(
         "[*] 已转换 grok2api Grok Build: created={created} linked={linked} "
         "skipped={skipped} failed={failed} synced={synced} syncFailed={syncFailed}".format(
@@ -1774,10 +1839,6 @@ def _convert_imported_web_to_build(api_base: str, access: str, imported: int) ->
         )
     )
     if int(result.get("failed") or 0) or int(result.get("syncFailed") or 0):
-        created = int(result.get("created") or 0)
-        linked = int(result.get("linked") or 0)
-        if created + linked <= 0:
-            raise Exception("Web 已导入，但转 Build 未全部成功")
         print("[Warn] 部分 Web 转 Build 未成功，下一轮会重试未关联号")
 
 
@@ -1799,7 +1860,7 @@ def push_sso_to_grok2api_go(new_tokens: list, api_conf: dict) -> bool:
             api_base + "/accounts/web/import",
             headers={"Authorization": f"Bearer {access}", "Accept": "text/event-stream"},
             files={"file": ("grok-web-sso.txt", payload, "text/plain; charset=utf-8")},
-            timeout=120,
+            timeout=25,
         )
         if resp.status_code == 401 and attempt == 0:
             continue
@@ -1818,7 +1879,10 @@ def push_sso_to_grok2api_go(new_tokens: list, api_conf: dict) -> bool:
         if sync_failed:
             raise Exception("SSO 已导入，但初始同步失败")
         if _convert_to_build_enabled(api_conf):
-            _convert_imported_web_to_build(api_base, access, created + updated)
+            try:
+                _convert_imported_web_to_build(api_base, access, created + updated)
+            except Exception as convert_exc:
+                print(f"[Warn] Web 已导入，转 Build 失败（下一轮会重试）: {convert_exc}")
         return True
     raise Exception(last_error or "grok2api 管理员认证已失效")
 
@@ -1975,27 +2039,83 @@ def load_run_workers() -> int:
 
 BROWSER_RECYCLE_EVERY = 20
 SINGLE_ROUND_TIMEOUT = 150
+_push_queue = None
+_push_thread = None
+
+
+def _ensure_push_worker() -> None:
+    global _push_queue, _push_thread
+    if _push_thread is not None and _push_thread.is_alive():
+        return
+    local_queue = queue.Queue()
+    _push_queue = local_queue
+
+    def _loop():
+        while True:
+            item = local_queue.get()
+            try:
+                if item is None:
+                    break
+                push_sso_to_api(item)
+            except Exception as exc:
+                print(f"[Warn] 后台推送 grok2api 失败: {exc}")
+            finally:
+                local_queue.task_done()
+
+    _push_thread = threading.Thread(target=_loop, daemon=True, name="grok2api-push")
+    _push_thread.start()
+
+
+def enqueue_sso_push(tokens: list) -> None:
+    tokens = [item for item in tokens if item]
+    if not tokens:
+        return
+    _ensure_push_worker()
+    _push_queue.put(list(tokens))
+
+
+def drain_sso_push(timeout: float = 60) -> None:
+    global _push_queue, _push_thread
+    if _push_queue is None or _push_thread is None:
+        return
+    pending = _push_queue
+    worker = _push_thread
+    pending.put(None)
+    worker.join(timeout)
+    if worker.is_alive():
+        print("[Warn] 后台 grok2api 推送未在时限内结束，已继续关闭浏览器")
+        return
+    _push_thread = None
+    _push_queue = None
 
 
 def _run_single_registration_with_timeout(output_path, extract_numbers=False, timeout=SINGLE_ROUND_TIMEOUT):
-    # Chrome/CDP 卡住时 Python 自己的 while 超时不会触发。到点强制 quit。
-    stop_event = threading.Event()
+    # Chrome/CDP 卡住时主线程 while 超时不会触发。一轮放到子线程，到期杀 Chrome 并放弃。
+    box = {}
 
-    def _kill_hung_browser():
-        if stop_event.wait(timeout):
-            return
+    def _target():
+        try:
+            box["result"] = run_single_registration(output_path, extract_numbers=extract_numbers)
+        except BaseException as exc:
+            box["error"] = exc
+
+    worker = threading.Thread(target=_target, daemon=True, name="register-round")
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
         print(f"[Warn] 单轮超过 {timeout}s，强制关闭 Chrome")
         try:
             stop_browser()
         except Exception:
             pass
-
-    watcher = threading.Thread(target=_kill_hung_browser, daemon=True)
-    watcher.start()
-    try:
-        return run_single_registration(output_path, extract_numbers=extract_numbers)
-    finally:
-        stop_event.set()
+        worker.join(8)
+        raise Exception(f"单轮超过 {timeout}s，已强制结束")
+    error = box.get("error")
+    if error is not None:
+        raise error
+    if "result" not in box:
+        raise Exception("单轮注册异常结束")
+    return box["result"]
 
 
 def run_batch_rounds(count, output_path, extract_numbers=False, worker_id=None):
@@ -2024,10 +2144,7 @@ def run_batch_rounds(count, output_path, extract_numbers=False, worker_id=None):
                 success_count += 1
                 reuse_ok = True
                 note_proxy_success()
-                try:
-                    push_sso_to_api([result["sso"]])
-                except Exception as push_exc:
-                    print(f"[Warn] {prefix}本轮推送 grok2api 失败: {push_exc}")
+                enqueue_sso_push([result["sso"]])
             except KeyboardInterrupt:
                 print(f"\n[Info] {prefix}收到中断信号，停止后续轮次。")
                 break
@@ -2079,12 +2196,13 @@ def run_batch_rounds(count, output_path, extract_numbers=False, worker_id=None):
         )
         if collected_sso and not go_mode:
             print(f"\n[*] {prefix}注册完成，推送 {len(collected_sso)} 个 token 到旧版 API...")
-            push_sso_to_api(collected_sso)
+            enqueue_sso_push(collected_sso)
+        drain_sso_push()
         stop_browser()
 
 
-def _mp_worker_main(worker_id, count, output_path, extract_numbers, proxies, result_queue):
-    global run_logger, _proxy_pool, _proxy_index, _browser_proxy, _proxy_dead, _proxy_stats
+def _mp_worker_main(worker_id, count, output_path, extract_numbers, proxies, fallback, result_queue):
+    global run_logger, _proxy_pool, _proxy_fallback_pool, _proxy_index, _browser_proxy, _proxy_dead, _proxy_stats
     os.environ["GROK_REGISTER_MP_WORKER"] = "1"
     try:
         sys.stdout.reconfigure(line_buffering=True)
@@ -2093,11 +2211,15 @@ def _mp_worker_main(worker_id, count, output_path, extract_numbers, proxies, res
         pass
     run_logger = setup_run_logger()
     _proxy_pool = list(proxies or [])
+    _proxy_fallback_pool = list(fallback or [])
     _proxy_index = 0
     _browser_proxy = ""
     _proxy_dead = set()
     _proxy_stats.clear()
-    print(f"[W{worker_id}] 启动，配额 {count} 轮，独占代理 {len(_proxy_pool)} 条")
+    print(
+        f"[W{worker_id}] 启动，配额 {count} 轮，独占代理 {len(_proxy_pool)} 条，"
+        f"共享兜底 {len(_proxy_fallback_pool)} 条"
+    )
     success = fail = 0
     try:
         success, fail, _ = run_batch_rounds(
@@ -2139,7 +2261,7 @@ def _run_multiprocess(args):
                 assigned = list(_proxy_pool)
             proc = ctx.Process(
                 target=_mp_worker_main,
-                args=(i, quota, args.output, args.extract_numbers, assigned, result_queue),
+                args=(i, quota, args.output, args.extract_numbers, assigned, list(_proxy_pool), result_queue),
                 name=f"register-w{i}",
             )
             proc.start()
