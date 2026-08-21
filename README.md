@@ -48,6 +48,7 @@ pip install -r requirements.txt
 | `browser_proxy` / `browser_proxies` | 浏览器出口；池内预检，失败两次才跳过，按成功次数打分 |
 | `api.base` + 管理员账号 | 新版 grok2api，成功后导入 Web，并默认转成 Build |
 | `api.convert_to_build` | 默认 `true`；`false` 或 `--no-convert-to-build` 则只留 Web |
+| `api.sync_to_console` | 默认 `true`；`false` 或 `--no-sync-to-console` 则不同步 Console |
 | `api.endpoint` / `api.token` | 旧版 Python grok2api 的 `ssoBasic`；配了 `api.base` 时忽略 |
 
 代理写成 `http://host:port`。优先 HTTP，SOCKS 启动 Chrome 不稳定。`proxy` 和 `browser_proxies` 不要混用。非本机 `api.base` 必须 HTTPS。
@@ -75,15 +76,16 @@ DISABLE_XVFB=1 python3 register.py
 
 ## grok2api
 
-导入的是 **Grok Web SSO**，不是官方 API Key。新版（Go）填 `api.base` + 管理员账号：每轮成功先 `/accounts/web/import`，再默认 `/accounts/web/convert-to-build`（`strategy=missing`），这样才能调 `grok-4.6`。只导入已有文件用 `--push-sso`。旧版用 `api.endpoint` + `api.token`。两种都配时走新版。不想转 Build 时设 `api.convert_to_build: false` 或加 `--no-convert-to-build`。
+导入的是 **Grok Web SSO**，不是官方 API Key。新版（Go）填 `api.base` + 管理员账号：每轮成功先 `/accounts/web/import`，再默认 `/accounts/web/convert-to-build`（`strategy=missing`）和 `/accounts/web/sync-to-console`。只导入已有文件用 `--push-sso`。旧版用 `api.endpoint` + `api.token`。两种都配时走新版。不想转 Build / 同步 Console 时设对应配置为 `false`，或加 `--no-convert-to-build` / `--no-sync-to-console`。
 
 | 调用名 | 实际来源 |
 | --- | --- |
 | `grok-chat-fast` | grok.com Fast 档，不是官方 `grok-4.6` |
 | `grok-chat-auto` / `expert` / `heavy` | 网页对应档，分别要 Super / Heavy |
-| `grok-4.6` | Grok Build 或 Console，需 Build OAuth |
+| `grok-4.6` | Grok Build，需 Build OAuth |
+| `grok-4.5-console` / `Console/grok-4.5` | Grok Console 的 4.5（Web SSO 同步后可用）。Console **没有** `grok-4.6` |
 
-要 `grok-4.6`：账号需在 Grok Build 池里（默认导入后会转），客户端密钥 `providerScope` 含 `grok_build`，并给 Build 配出口。存量 Web 可再调 `POST /api/admin/v1/accounts/web/convert-to-build`，`{"all": true, "strategy": "missing"}`。推理档：`grok-4.6-low` / `-medium` / `-high` / `-xhigh`。
+要 `grok-4.6`：账号需在 Grok Build 池里（默认导入后会转），客户端密钥 `providerScope` 含 `grok_build`，并给 Build 配出口。要 Console 4.5：默认导入后会 `sync-to-console`，密钥已开模型别名时用 `grok-4.5-console`，并给 Console 配出口。存量 Web 可再调 `POST /api/admin/v1/accounts/web/convert-to-build` 或 `/accounts/web/sync-to-console`，`{"all": true, "strategy": "missing"}`。推理档：`grok-4.6-low` / `-medium` / `-high` / `-xhigh`。
 
 ## 产出
 
@@ -96,6 +98,7 @@ DISABLE_XVFB=1 python3 register.py
 - **Turnstile token 一直为 0**：出口分太低。换住宅代理，或在有桌面的机器上跑。
 - **Chrome 起不来**：用系统 Chrome，不要给 DrissionPage 设 `user-data-path`。
 - **chat 没有 grok-4.6**：确认已转成 Build，密钥包含 `grok_build`。用 `--no-convert-to-build` 时不会出现 4.6。
+- **想用 Console 满血 4.5**：模型写 `grok-4.5-console`。Console 没有 `grok-4.6`。
 
 ## 致谢
 

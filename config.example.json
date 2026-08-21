@@ -17,6 +17,7 @@
         "base": "",
         "admin_username": "",
         "admin_password": "",
-        "convert_to_build": true
+        "convert_to_build": true,
+        "sync_to_console": true
     }
 }
